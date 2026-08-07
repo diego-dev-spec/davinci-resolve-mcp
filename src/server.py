@@ -25304,6 +25304,59 @@ def _fusion_get_text_plus(comp, p: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _fusion_parse_bezier_point(frame, entry):
+    """Normalize one BezierSpline.GetKeyFrames() entry to {time, value, lh, rh, flags}.
+
+    `entry` is the raw per-frame value from BezierSpline.GetKeyFrames(), e.g.
+    {1: 0.5, 'RH': {1: 20.0, 2: 0.333...}} — empirically confirmed shape (no
+    Input.GetKeyFrames() equivalent exists; this is the Tool-level method).
+    Handles use positional keys 1/2 for (time_offset, value_offset).
+
+    Returns (point_dict, None) on a clean match, or (None, problem_str) if the
+    shape doesn't match what's been observed — callers must surface that as an
+    error with the raw data attached, never guess a normalized value.
+    """
+    if not isinstance(frame, (int, float)):
+        return None, f"top-level key {frame!r} is not numeric (frame/time expected)"
+    if not isinstance(entry, dict):
+        return None, f"frame {frame!r}: entry is not a dict (got {type(entry).__name__})"
+    if 1 not in entry:
+        return None, f"frame {frame!r}: missing value key 1"
+    value = entry[1]
+    if not isinstance(value, (int, float)):
+        return None, f"frame {frame!r}: value is not numeric ({value!r})"
+    known_keys = {1, "LH", "RH", "Flags"}
+    extra_keys = set(entry.keys()) - known_keys
+    if extra_keys:
+        return None, f"frame {frame!r}: unexpected keys {sorted(map(repr, extra_keys))}"
+
+    def _handle(name):
+        h = entry.get(name)
+        if h is None:
+            return None, None
+        if not isinstance(h, dict) or 1 not in h or 2 not in h:
+            return None, f"frame {frame!r}: {name} has unexpected shape ({h!r})"
+        tx, ty = h[1], h[2]
+        if not isinstance(tx, (int, float)) or not isinstance(ty, (int, float)):
+            return None, f"frame {frame!r}: {name} offsets are not numeric ({h!r})"
+        return {"time_offset": _ser(tx), "value_offset": _ser(ty)}, None
+
+    lh, lh_problem = _handle("LH")
+    if lh_problem:
+        return None, lh_problem
+    rh, rh_problem = _handle("RH")
+    if rh_problem:
+        return None, rh_problem
+
+    return {
+        "time": _ser(frame),
+        "value": _ser(value),
+        "lh": lh,
+        "rh": rh,
+        "flags": _ser(entry.get("Flags")),
+    }, None
+
+
 @mcp.tool()
 @_guard_missing_params
 def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -25332,6 +25385,14 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
       get_attrs(tool_name) -> {attrs}
       add_keyframe(tool_name, input_name, time, value) -> {success}
       get_keyframes(tool_name, input_name) -> {keyframes}
+      get_spline_curve(tool_name, input_name) -> {success, modifier_type, modifier_name, points}
+        Read the full BezierSpline curve (value + LH/RH handles + Flags) behind an
+        animated input — richer than get_keyframes (times only). Each point in
+        `points` is {time, value, lh, rh, flags}; lh/rh are {time_offset,
+        value_offset} or null. v1 only supports BezierSpline modifiers (errors
+        clearly on Path or anything else) and only reads — no SetKeyFrames/
+        DeleteKeyFrames/AdjustKeyFrames. Errors rather than guessing if a keyframe
+        entry doesn't match the validated shape.
       delete_keyframe(tool_name, input_name, time) -> {success}
       get_comp_info() -> {name, tool_count, attrs}
       get_position(tool_name) -> {tool_name, x, y}  — read a node's FlowView position
@@ -25621,6 +25682,81 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
                 value = tool.GetInput(p["input_name"], frame)
                 keyframes.append({"time": frame, "value": _ser(value)})
         return {"keyframes": keyframes}
+
+    elif action == "get_spline_curve":
+        tool = comp.FindTool(p["tool_name"])
+        if not tool:
+            return _err(f"Tool '{p['tool_name']}' not found")
+        inp = tool[p["input_name"]]
+        if not inp:
+            return _err(f"Input '{p['input_name']}' not found on tool '{p['tool_name']}'")
+
+        # Deliberately no FindTool()-by-name fallback here: the modifier is
+        # located purely via GetConnectedOutput() -> GetTool(), the same path
+        # validated empirically against a live BezierSpline before this action
+        # was written. A name fallback would mask exactly which step of that
+        # path is failing.
+        try:
+            output = inp.GetConnectedOutput()
+        except Exception as exc:
+            return _err(f"GetConnectedOutput() failed: {exc}", category="resolve_api_failed")
+        if output is None:
+            return _err(
+                f"Input '{p['input_name']}' on '{p['tool_name']}' is not animated "
+                "(no connected modifier)",
+                code="NOT_ANIMATED", category="invalid_input",
+            )
+
+        try:
+            modifier_tool = output.GetTool()
+        except Exception as exc:
+            return _err(f"GetTool() failed: {exc}", category="resolve_api_failed")
+        if modifier_tool is None:
+            return _err("Connected output has no owning Tool", category="resolve_api_failed")
+
+        mod_attrs = modifier_tool.GetAttrs() or {}
+        modifier_type = mod_attrs.get("TOOLS_RegID")
+        if modifier_type != "BezierSpline":
+            return _err(
+                f"Connected modifier is '{modifier_type}', not 'BezierSpline' — "
+                "get_spline_curve only supports BezierSpline in v1 (e.g. Point "
+                "inputs animated via modifier='Path' are not supported)",
+                code="UNSUPPORTED_MODIFIER", category="invalid_input",
+                state={"modifier_type": modifier_type},
+            )
+
+        # No hasattr() gate: TOOLS_RegID already confirmed this is a
+        # BezierSpline, so the call is made directly and only guarded against
+        # raising, per the same pattern validated in the native read-only probe.
+        try:
+            raw = modifier_tool.GetKeyFrames()
+        except Exception as exc:
+            return _err(f"BezierSpline.GetKeyFrames() failed: {exc}", category="resolve_api_failed")
+
+        points = []
+        problems = []
+        if raw:
+            for frame in sorted(raw):
+                point, problem = _fusion_parse_bezier_point(frame, raw[frame])
+                if problem:
+                    problems.append(problem)
+                else:
+                    points.append(point)
+
+        if problems:
+            return _err(
+                "get_spline_curve: BezierSpline.GetKeyFrames() returned a shape "
+                "that doesn't match the validated {value, LH?, RH?, Flags?} "
+                "structure, refusing to guess: " + "; ".join(problems),
+                code="UNPARSEABLE_CURVE", category="resolve_api_failed",
+                state={"raw_curve": _ser(raw)},
+            )
+
+        return _ok(
+            modifier_type=modifier_type,
+            modifier_name=mod_attrs.get("TOOLS_Name", ""),
+            points=points,
+        )
 
     elif action == "delete_keyframe":
         tool = comp.FindTool(p["tool_name"])
