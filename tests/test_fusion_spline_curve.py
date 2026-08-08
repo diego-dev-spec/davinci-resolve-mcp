@@ -7,6 +7,7 @@ Comparisons are semantic (numeric tolerance on floats via assertAlmostEqual),
 never string/byte equality against raw Fusion output — floats crossing the
 bridge are not guaranteed to be bit-identical.
 """
+import copy
 import unittest
 from unittest import mock
 
@@ -70,10 +71,51 @@ class FakeComp:
     def FindTool(self, name):
         return self._tools.get(name)
 
+    # No-ops: get_spline_curve never calls these (read-only), but
+    # set_spline_handles does (Lock/Unlock around the write, StartUndo/EndUndo
+    # wrapping it) — present unconditionally so the same FakeComp works for
+    # both action's tests.
+    def Lock(self):
+        pass
+
+    def Unlock(self):
+        pass
+
+    def StartUndo(self, name):
+        pass
+
+    def EndUndo(self, keep):
+        pass
+
+
+class FakeWritableModifierTool(FakeModifierTool):
+    """FakeModifierTool with a working SetKeyFrames(). set_spline_handles
+    always re-reads via GetKeyFrames() immediately after writing, so the
+    fake must actually reflect the write for read-back verification to be
+    exercised meaningfully."""
+
+    def __init__(self, *args, raise_on_set_keyframes=None, corrupt_after_write=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._raise_on_set = raise_on_set_keyframes
+        self._corrupt_after_write = corrupt_after_write
+        self.set_keyframes_calls = []
+
+    def SetKeyFrames(self, raw):
+        self.set_keyframes_calls.append(raw)
+        if self._raise_on_set is not None:
+            raise self._raise_on_set
+        self._keyframes = self._corrupt_after_write if self._corrupt_after_write is not None else raw
+        return None  # empirically confirmed return value — see Gate A/B/C
+
 
 def _dispatch(comp, params):
     with mock.patch.object(s, "_resolve_fusion_comp", return_value=(comp, None)):
         return s.fusion_comp("get_spline_curve", params)
+
+
+def _dispatch_set(comp, params):
+    with mock.patch.object(s, "_resolve_fusion_comp", return_value=(comp, None)):
+        return s.fusion_comp("set_spline_handles", params)
 
 
 # Raw shape captured empirically from BezierSpline.GetKeyFrames() against a
@@ -241,6 +283,206 @@ class GetSplineCurveTests(unittest.TestCase):
         with mock.patch.object(s, "_resolve_fusion_comp", return_value=(comp, None)):
             out = s.fusion_comp("get_spline_curve", {"tool_name": "Transform1"})  # no input_name
         self.assertIn("error", out)
+
+
+class SetSplineHandlesTests(unittest.TestCase):
+    """set_spline_handles v1: LH/RH time_offset/value_offset on EXISTING
+    keyframes only — never creates/deletes keyframes or handles, never
+    touches time/value. Gate A/B/C already validated SetKeyFrames() itself
+    empirically against live Resolve; these tests exercise the wrapper's
+    own logic (validation-before-write, payload construction from the raw
+    structure, read-back verification) against a fake bridge."""
+
+    def _fresh_curve(self):
+        return copy.deepcopy(REAL_RAW_CURVE)
+
+    def _writable_bezier(self, keyframes, raise_on_set_keyframes=None,
+                          corrupt_after_write=None, modifier_regid="BezierSpline"):
+        modifier = FakeWritableModifierTool(
+            modifier_regid, name="Transform_LabSize", keyframes=keyframes,
+            raise_on_set_keyframes=raise_on_set_keyframes,
+            corrupt_after_write=corrupt_after_write,
+        )
+        output = FakeOutput(tool=modifier)
+        inp = FakeInput(connected_output=output)
+        tool = FakeTool({"Size": inp})
+        comp = FakeComp({"Transform1": tool})
+        return comp, modifier
+
+    def test_rh_value_offset_valid(self):
+        comp, modifier = self._writable_bezier(self._fresh_curve())
+        out = _dispatch_set(comp, {
+            "tool_name": "Transform1", "input_name": "Size",
+            "handles": [{"frame": 0.0, "side": "RH", "value_offset": 0.0}],
+        })
+        self.assertTrue(out.get("success"), out)
+        self.assertEqual(modifier._keyframes[0.0]["RH"][2], 0.0)
+        self.assertEqual(modifier._keyframes[0.0]["RH"][1], 20.0)  # untouched
+        by_time = {pt["time"]: pt for pt in out["points"]}
+        self.assertAlmostEqual(by_time[0.0]["rh"]["value_offset"], 0.0, places=9)
+
+    def test_rh_time_offset_valid(self):
+        comp, modifier = self._writable_bezier(self._fresh_curve())
+        out = _dispatch_set(comp, {
+            "tool_name": "Transform1", "input_name": "Size",
+            "handles": [{"frame": 0.0, "side": "RH", "time_offset": 10.0}],
+        })
+        self.assertTrue(out.get("success"), out)
+        self.assertEqual(modifier._keyframes[0.0]["RH"][1], 10.0)
+        self.assertAlmostEqual(modifier._keyframes[0.0]["RH"][2], 0.33333333333333326, places=9)
+
+    def test_rh_both_components(self):
+        comp, modifier = self._writable_bezier(self._fresh_curve())
+        out = _dispatch_set(comp, {
+            "tool_name": "Transform1", "input_name": "Size",
+            "handles": [{"frame": 0.0, "side": "RH", "time_offset": 5.0, "value_offset": 0.1}],
+        })
+        self.assertTrue(out.get("success"), out)
+        self.assertEqual(modifier._keyframes[0.0]["RH"][1], 5.0)
+        self.assertEqual(modifier._keyframes[0.0]["RH"][2], 0.1)
+
+    def test_lh_value_offset_valid(self):
+        comp, modifier = self._writable_bezier(self._fresh_curve())
+        out = _dispatch_set(comp, {
+            "tool_name": "Transform1", "input_name": "Size",
+            "handles": [{"frame": 60.0, "side": "LH", "value_offset": -0.5}],
+        })
+        self.assertTrue(out.get("success"), out)
+        self.assertEqual(modifier._keyframes[60.0]["LH"][2], -0.5)
+
+    def test_lh_time_offset_valid(self):
+        comp, modifier = self._writable_bezier(self._fresh_curve())
+        out = _dispatch_set(comp, {
+            "tool_name": "Transform1", "input_name": "Size",
+            "handles": [{"frame": 60.0, "side": "LH", "time_offset": -10.0}],
+        })
+        self.assertTrue(out.get("success"), out)
+        self.assertEqual(modifier._keyframes[60.0]["LH"][1], -10.0)
+
+    def test_multiple_handles_one_call(self):
+        comp, modifier = self._writable_bezier(self._fresh_curve())
+        out = _dispatch_set(comp, {
+            "tool_name": "Transform1", "input_name": "Size",
+            "handles": [
+                {"frame": 0.0, "side": "RH", "value_offset": 0.0},
+                {"frame": 60.0, "side": "LH", "time_offset": -10.0},
+            ],
+        })
+        self.assertTrue(out.get("success"), out)
+        self.assertEqual(modifier._keyframes[0.0]["RH"][2], 0.0)
+        self.assertEqual(modifier._keyframes[60.0]["LH"][1], -10.0)
+        self.assertEqual(len(modifier.set_keyframes_calls), 1)  # exactly one write call
+
+    def test_time_field_rejected(self):
+        comp, modifier = self._writable_bezier(self._fresh_curve())
+        out = _dispatch_set(comp, {
+            "tool_name": "Transform1", "input_name": "Size",
+            "handles": [{"frame": 0.0, "side": "RH", "value_offset": 0.0, "time": 5.0}],
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "UNKNOWN_HANDLE_FIELD")
+        self.assertEqual(out["error"]["state"]["unknown_fields"], ["time"])
+        self.assertEqual(modifier.set_keyframes_calls, [])
+
+    def test_value_field_rejected(self):
+        comp, modifier = self._writable_bezier(self._fresh_curve())
+        out = _dispatch_set(comp, {
+            "tool_name": "Transform1", "input_name": "Size",
+            "handles": [{"frame": 0.0, "side": "RH", "value_offset": 0.0, "value": 0.9}],
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "UNKNOWN_HANDLE_FIELD")
+        self.assertEqual(out["error"]["state"]["unknown_fields"], ["value"])
+        self.assertEqual(modifier.set_keyframes_calls, [])
+
+    def test_arbitrary_unknown_field_rejected(self):
+        comp, modifier = self._writable_bezier(self._fresh_curve())
+        out = _dispatch_set(comp, {
+            "tool_name": "Transform1", "input_name": "Size",
+            "handles": [{"frame": 0.0, "side": "RH", "value_offset": 0.0, "flags": {"Linear": True}}],
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "UNKNOWN_HANDLE_FIELD")
+        self.assertEqual(out["error"]["state"]["unknown_fields"], ["flags"])
+        self.assertEqual(modifier.set_keyframes_calls, [])
+
+    def test_unknown_frame_rejected_before_write(self):
+        comp, modifier = self._writable_bezier(self._fresh_curve())
+        out = _dispatch_set(comp, {
+            "tool_name": "Transform1", "input_name": "Size",
+            "handles": [{"frame": 30.0, "side": "RH", "value_offset": 0.0}],
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "UNKNOWN_KEYFRAME")
+        self.assertEqual(modifier.set_keyframes_calls, [])  # never wrote
+
+    def test_unknown_handle_rejected_before_write(self):
+        comp, modifier = self._writable_bezier(self._fresh_curve())
+        out = _dispatch_set(comp, {
+            "tool_name": "Transform1", "input_name": "Size",
+            "handles": [{"frame": 0.0, "side": "LH", "value_offset": 0.0}],  # frame 0 has no LH
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "UNKNOWN_HANDLE")
+        self.assertEqual(modifier.set_keyframes_calls, [])
+
+    def test_modifier_not_bezierspline_rejected(self):
+        comp, modifier = self._writable_bezier({0.0: {1: [0.5, 0.5]}}, modifier_regid="Path")
+        out = _dispatch_set(comp, {
+            "tool_name": "Transform1", "input_name": "Size",
+            "handles": [{"frame": 0.0, "side": "RH", "value_offset": 0.0}],
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "UNSUPPORTED_MODIFIER")
+
+    def test_neither_component_present_rejected(self):
+        comp, modifier = self._writable_bezier(self._fresh_curve())
+        out = _dispatch_set(comp, {
+            "tool_name": "Transform1", "input_name": "Size",
+            "handles": [{"frame": 0.0, "side": "RH"}],
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "MISSING_HANDLE_COMPONENT")
+        self.assertEqual(modifier.set_keyframes_calls, [])
+
+    def test_setkeyframes_exception_is_failure(self):
+        comp, modifier = self._writable_bezier(
+            self._fresh_curve(), raise_on_set_keyframes=RuntimeError("boom"),
+        )
+        out = _dispatch_set(comp, {
+            "tool_name": "Transform1", "input_name": "Size",
+            "handles": [{"frame": 0.0, "side": "RH", "value_offset": 0.0}],
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "SETKEYFRAMES_FAILED")
+
+    def test_readback_mismatch_is_failure(self):
+        # Simulate Fusion silently corrupting an untouched keyframe (value
+        # changed on frame 60, never requested) — must be caught, not missed.
+        corrupted = self._fresh_curve()
+        corrupted[60.0][1] = 999.0
+        comp, modifier = self._writable_bezier(self._fresh_curve(), corrupt_after_write=corrupted)
+        out = _dispatch_set(comp, {
+            "tool_name": "Transform1", "input_name": "Size",
+            "handles": [{"frame": 0.0, "side": "RH", "value_offset": 0.0}],
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "READBACK_MISMATCH")
+
+    def test_unmentioned_frame_and_handle_preserved(self):
+        comp, modifier = self._writable_bezier(self._fresh_curve())
+        out = _dispatch_set(comp, {
+            "tool_name": "Transform1", "input_name": "Size",
+            "handles": [{"frame": 0.0, "side": "RH", "value_offset": 0.0}],
+        })
+        self.assertTrue(out.get("success"), out)
+        # frame 60 / LH untouched
+        self.assertEqual(modifier._keyframes[60.0][1], 1.5)
+        self.assertEqual(modifier._keyframes[60.0]["LH"][1], -20.0)
+        self.assertAlmostEqual(modifier._keyframes[60.0]["LH"][2], -0.3333333333333335, places=9)
+        # frame 0 value/RH[1] untouched
+        self.assertEqual(modifier._keyframes[0.0][1], 0.5)
+        self.assertEqual(modifier._keyframes[0.0]["RH"][1], 20.0)
 
 
 if __name__ == "__main__":

@@ -1626,6 +1626,14 @@ Key actions:
   `Path` or any other connected modifier type, or on a keyframe entry whose shape
   doesn't match the validated `{value, LH?, RH?, Flags?}` structure. No
   `SetKeyFrames`/`DeleteKeyFrames`/`AdjustKeyFrames` yet.
+- `set_spline_handles(tool_name, input_name, handles)` — modify `LH`/`RH` handle
+  offsets on an existing `BezierSpline` curve. `handles` is a non-empty list of
+  `{frame, side, time_offset?, value_offset?}`; `frame`/`side` must already exist
+  (never creates keyframes or handles), `time`/`value` are not accepted (cannot
+  move or rescale keyframes, only reshape the curve between them). Reads
+  `GetKeyFrames()` fresh, mutates a copy, calls `SetKeyFrames()` once (`replace`
+  omitted), and verifies the read-back matches the intended curve exactly before
+  reporting success.
 - `get_position(tool_name)` / `set_position(tool_name, x, y)` — read/write a node's
   position on the FlowView canvas; `set_position` returns a position read-back
 - `copy_tool(tool_name, name?, x?, y?)` — duplicate a node (settings copied via a
