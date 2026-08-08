@@ -1618,6 +1618,22 @@ Key actions:
 - `get_inputs(tool_name)` / `get_outputs(tool_name)`
 - `set_attrs(tool_name, attrs)` / `get_attrs(tool_name)`
 - `add_keyframe(tool_name, input_name, time, value)`
+- `get_spline_curve(tool_name, input_name)` — read the full `BezierSpline` curve
+  behind an animated input: value + `LH`/`RH` handles + `Flags` per keyframe,
+  normalized to `{time, value, lh, rh, flags}` (handles as `{time_offset,
+  value_offset}` or `null`). Complements `get_keyframes` (times only). Read-only,
+  v1 only supports `BezierSpline` modifiers — errors clearly (does not guess) on
+  `Path` or any other connected modifier type, or on a keyframe entry whose shape
+  doesn't match the validated `{value, LH?, RH?, Flags?}` structure. No
+  `SetKeyFrames`/`DeleteKeyFrames`/`AdjustKeyFrames` yet.
+- `set_spline_handles(tool_name, input_name, handles)` — modify `LH`/`RH` handle
+  offsets on an existing `BezierSpline` curve. `handles` is a non-empty list of
+  `{frame, side, time_offset?, value_offset?}`; `frame`/`side` must already exist
+  (never creates keyframes or handles), `time`/`value` are not accepted (cannot
+  move or rescale keyframes, only reshape the curve between them). Reads
+  `GetKeyFrames()` fresh, mutates a copy, calls `SetKeyFrames()` once (`replace`
+  omitted), and verifies the read-back matches the intended curve exactly before
+  reporting success.
 - `get_position(tool_name)` / `set_position(tool_name, x, y)` — read/write a node's
   position on the FlowView canvas; `set_position` returns a position read-back
 - `copy_tool(tool_name, name?, x?, y?)` — duplicate a node (settings copied via a

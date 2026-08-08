@@ -14,6 +14,7 @@ Usage:
 VERSION = "2.86.2"
 
 import base64
+import copy
 import os
 import sys
 import functools
@@ -25304,6 +25305,111 @@ def _fusion_get_text_plus(comp, p: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _fusion_parse_bezier_point(frame, entry):
+    """Normalize one BezierSpline.GetKeyFrames() entry to {time, value, lh, rh, flags}.
+
+    `entry` is the raw per-frame value from BezierSpline.GetKeyFrames(), e.g.
+    {1: 0.5, 'RH': {1: 20.0, 2: 0.333...}} — empirically confirmed shape (no
+    Input.GetKeyFrames() equivalent exists; this is the Tool-level method).
+    Handles use positional keys 1/2 for (time_offset, value_offset).
+
+    Returns (point_dict, None) on a clean match, or (None, problem_str) if the
+    shape doesn't match what's been observed — callers must surface that as an
+    error with the raw data attached, never guess a normalized value.
+    """
+    if not isinstance(frame, (int, float)):
+        return None, f"top-level key {frame!r} is not numeric (frame/time expected)"
+    if not isinstance(entry, dict):
+        return None, f"frame {frame!r}: entry is not a dict (got {type(entry).__name__})"
+    if 1 not in entry:
+        return None, f"frame {frame!r}: missing value key 1"
+    value = entry[1]
+    if not isinstance(value, (int, float)):
+        return None, f"frame {frame!r}: value is not numeric ({value!r})"
+    known_keys = {1, "LH", "RH", "Flags"}
+    extra_keys = set(entry.keys()) - known_keys
+    if extra_keys:
+        return None, f"frame {frame!r}: unexpected keys {sorted(map(repr, extra_keys))}"
+
+    def _handle(name):
+        h = entry.get(name)
+        if h is None:
+            return None, None
+        if not isinstance(h, dict) or 1 not in h or 2 not in h:
+            return None, f"frame {frame!r}: {name} has unexpected shape ({h!r})"
+        tx, ty = h[1], h[2]
+        if not isinstance(tx, (int, float)) or not isinstance(ty, (int, float)):
+            return None, f"frame {frame!r}: {name} offsets are not numeric ({h!r})"
+        return {"time_offset": _ser(tx), "value_offset": _ser(ty)}, None
+
+    lh, lh_problem = _handle("LH")
+    if lh_problem:
+        return None, lh_problem
+    rh, rh_problem = _handle("RH")
+    if rh_problem:
+        return None, rh_problem
+
+    return {
+        "time": _ser(frame),
+        "value": _ser(value),
+        "lh": lh,
+        "rh": rh,
+        "flags": _ser(entry.get("Flags")),
+    }, None
+
+
+def _fusion_raw_curve_semantically_equal(a, b, tol=1e-6):
+    """Compare two BezierSpline.GetKeyFrames()-shaped raw dicts for semantic
+    equality (numeric tolerance, never textual/representation equality).
+
+    Used by set_spline_handles to confirm a read-back matches the exact
+    curve it intended to write -- covers keyframe count, frame positions,
+    values, untouched handles, and Flags all in one comparison, since the
+    "intended" side is the full pre-write structure with only the requested
+    handle components mutated.
+
+    Returns (equal, diffs) -- diffs lists every mismatch found, not just the
+    first, so a failure can be reported in full rather than guessed at.
+    """
+    diffs = []
+    a_keys = sorted((k for k in a if isinstance(k, (int, float))), key=float)
+    b_keys = sorted((k for k in b if isinstance(k, (int, float))), key=float)
+    if len(a_keys) != len(b_keys):
+        diffs.append(f"keyframe count differs: {len(a_keys)} vs {len(b_keys)}")
+        return False, diffs
+    for ka, kb in zip(a_keys, b_keys):
+        if abs(float(ka) - float(kb)) > tol:
+            diffs.append(f"frame differs: {ka!r} vs {kb!r}")
+            continue
+        ea, eb = a[ka], b[kb]
+        ea_keys, eb_keys = set(ea.keys()), set(eb.keys())
+        if ea_keys != eb_keys:
+            diffs.append(
+                f"frame {ka!r}: key set differs {sorted(map(repr, ea_keys))} "
+                f"vs {sorted(map(repr, eb_keys))}"
+            )
+        for key in ea_keys & eb_keys:
+            va, vb = ea[key], eb[key]
+            if isinstance(va, dict) and isinstance(vb, dict):
+                for hk in set(va) | set(vb):
+                    hva, hvb = va.get(hk), vb.get(hk)
+                    if hva is None or hvb is None:
+                        if hva != hvb:
+                            diffs.append(f"frame {ka!r} {key} [{hk!r}]: {hva!r} vs {hvb!r}")
+                    elif abs(float(hva) - float(hvb)) > tol:
+                        diffs.append(f"frame {ka!r} {key} [{hk!r}]: {hva!r} vs {hvb!r}")
+            else:
+                if va is None or vb is None:
+                    if va != vb:
+                        diffs.append(f"frame {ka!r} {key!r}: {va!r} vs {vb!r}")
+                elif isinstance(va, (int, float)) and isinstance(vb, (int, float)):
+                    if abs(float(va) - float(vb)) > tol:
+                        diffs.append(f"frame {ka!r} {key!r}: {va!r} vs {vb!r}")
+                elif va != vb:
+                    diffs.append(f"frame {ka!r} {key!r}: {va!r} vs {vb!r}")
+    return (len(diffs) == 0), diffs
+
+
 @mcp.tool()
 @_guard_missing_params
 def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -25332,6 +25438,25 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
       get_attrs(tool_name) -> {attrs}
       add_keyframe(tool_name, input_name, time, value) -> {success}
       get_keyframes(tool_name, input_name) -> {keyframes}
+      get_spline_curve(tool_name, input_name) -> {success, modifier_type, modifier_name, points}
+        Read the full BezierSpline curve (value + LH/RH handles + Flags) behind an
+        animated input — richer than get_keyframes (times only). Each point in
+        `points` is {time, value, lh, rh, flags}; lh/rh are {time_offset,
+        value_offset} or null. v1 only supports BezierSpline modifiers (errors
+        clearly on Path or anything else) and only reads — no SetKeyFrames/
+        DeleteKeyFrames/AdjustKeyFrames. Errors rather than guessing if a keyframe
+        entry doesn't match the validated shape.
+      set_spline_handles(tool_name, input_name, handles) -> {success, modifier_type, modifier_name, points}
+        Modify LH/RH handle offsets on an EXISTING BezierSpline curve. `handles` is
+        a non-empty list of {frame, side, time_offset?, value_offset?} — frame and
+        side must already exist on the curve (never creates keyframes or handles),
+        and at least one of time_offset/value_offset is required per entry. `time`
+        and `value` are not accepted — this action can only reshape the curve
+        between existing keyframes, never move or rescale them. Reads the raw
+        BezierSpline.GetKeyFrames() table fresh, mutates only the requested numeric
+        keys on a copy, calls SetKeyFrames() once (replace omitted), then verifies
+        the read-back matches the intended curve exactly before reporting success —
+        any mismatch is a hard error, never a silent partial write.
       delete_keyframe(tool_name, input_name, time) -> {success}
       get_comp_info() -> {name, tool_count, attrs}
       get_position(tool_name) -> {tool_name, x, y}  — read a node's FlowView position
@@ -25622,6 +25747,244 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
                 keyframes.append({"time": frame, "value": _ser(value)})
         return {"keyframes": keyframes}
 
+    elif action == "get_spline_curve":
+        tool = comp.FindTool(p["tool_name"])
+        if not tool:
+            return _err(f"Tool '{p['tool_name']}' not found")
+        inp = tool[p["input_name"]]
+        if not inp:
+            return _err(f"Input '{p['input_name']}' not found on tool '{p['tool_name']}'")
+
+        # Deliberately no FindTool()-by-name fallback here: the modifier is
+        # located purely via GetConnectedOutput() -> GetTool(), the same path
+        # validated empirically against a live BezierSpline before this action
+        # was written. A name fallback would mask exactly which step of that
+        # path is failing.
+        try:
+            output = inp.GetConnectedOutput()
+        except Exception as exc:
+            return _err(f"GetConnectedOutput() failed: {exc}", category="resolve_api_failed")
+        if output is None:
+            return _err(
+                f"Input '{p['input_name']}' on '{p['tool_name']}' is not animated "
+                "(no connected modifier)",
+                code="NOT_ANIMATED", category="invalid_input",
+            )
+
+        try:
+            modifier_tool = output.GetTool()
+        except Exception as exc:
+            return _err(f"GetTool() failed: {exc}", category="resolve_api_failed")
+        if modifier_tool is None:
+            return _err("Connected output has no owning Tool", category="resolve_api_failed")
+
+        mod_attrs = modifier_tool.GetAttrs() or {}
+        modifier_type = mod_attrs.get("TOOLS_RegID")
+        if modifier_type != "BezierSpline":
+            return _err(
+                f"Connected modifier is '{modifier_type}', not 'BezierSpline' — "
+                "get_spline_curve only supports BezierSpline in v1 (e.g. Point "
+                "inputs animated via modifier='Path' are not supported)",
+                code="UNSUPPORTED_MODIFIER", category="invalid_input",
+                state={"modifier_type": modifier_type},
+            )
+
+        # No hasattr() gate: TOOLS_RegID already confirmed this is a
+        # BezierSpline, so the call is made directly and only guarded against
+        # raising, per the same pattern validated in the native read-only probe.
+        try:
+            raw = modifier_tool.GetKeyFrames()
+        except Exception as exc:
+            return _err(f"BezierSpline.GetKeyFrames() failed: {exc}", category="resolve_api_failed")
+
+        points = []
+        problems = []
+        if raw:
+            for frame in sorted(raw):
+                point, problem = _fusion_parse_bezier_point(frame, raw[frame])
+                if problem:
+                    problems.append(problem)
+                else:
+                    points.append(point)
+
+        if problems:
+            return _err(
+                "get_spline_curve: BezierSpline.GetKeyFrames() returned a shape "
+                "that doesn't match the validated {value, LH?, RH?, Flags?} "
+                "structure, refusing to guess: " + "; ".join(problems),
+                code="UNPARSEABLE_CURVE", category="resolve_api_failed",
+                state={"raw_curve": _ser(raw)},
+            )
+
+        return _ok(
+            modifier_type=modifier_type,
+            modifier_name=mod_attrs.get("TOOLS_Name", ""),
+            points=points,
+        )
+
+    elif action == "set_spline_handles":
+        tool = comp.FindTool(p["tool_name"])
+        if not tool:
+            return _err(f"Tool '{p['tool_name']}' not found")
+        inp = tool[p["input_name"]]
+        if not inp:
+            return _err(f"Input '{p['input_name']}' not found on tool '{p['tool_name']}'")
+
+        # Same pure localization as get_spline_curve -- no FindTool()-by-name
+        # fallback. See rationale there.
+        try:
+            output = inp.GetConnectedOutput()
+        except Exception as exc:
+            return _err(f"GetConnectedOutput() failed: {exc}", category="resolve_api_failed")
+        if output is None:
+            return _err(
+                f"Input '{p['input_name']}' on '{p['tool_name']}' is not animated "
+                "(no connected modifier)",
+                code="NOT_ANIMATED", category="invalid_input",
+            )
+        try:
+            modifier_tool = output.GetTool()
+        except Exception as exc:
+            return _err(f"GetTool() failed: {exc}", category="resolve_api_failed")
+        if modifier_tool is None:
+            return _err("Connected output has no owning Tool", category="resolve_api_failed")
+
+        mod_attrs = modifier_tool.GetAttrs() or {}
+        modifier_type = mod_attrs.get("TOOLS_RegID")
+        if modifier_type != "BezierSpline":
+            return _err(
+                f"Connected modifier is '{modifier_type}', not 'BezierSpline' — "
+                "set_spline_handles only supports BezierSpline in v1",
+                code="UNSUPPORTED_MODIFIER", category="invalid_input",
+                state={"modifier_type": modifier_type},
+            )
+
+        requested = p.get("handles")
+        if not isinstance(requested, list) or not requested:
+            return _err(
+                "set_spline_handles requires params.handles: non-empty list of "
+                "{frame, side, time_offset?, value_offset?} (side is 'LH' or "
+                "'RH'; at least one of time_offset/value_offset is required "
+                "per entry; time and value are never editable through this action)."
+            )
+
+        try:
+            raw = modifier_tool.GetKeyFrames()
+        except Exception as exc:
+            return _err(f"BezierSpline.GetKeyFrames() failed: {exc}", category="resolve_api_failed")
+        raw = raw or {}
+
+        # Validate every requested edit BEFORE touching anything -- one bad
+        # entry aborts the whole call, nothing is written. Neither a
+        # keyframe nor a handle is ever created here: both must already
+        # exist in `raw`, matched by numeric tolerance, not exact key identity.
+        resolved = []
+        for i, h in enumerate(requested):
+            if not isinstance(h, dict):
+                return _err(f"handles[{i}] must be an object", code="INVALID_HANDLE")
+            unknown_keys = set(h.keys()) - {"frame", "side", "time_offset", "value_offset"}
+            if unknown_keys:
+                return _err(
+                    f"handles[{i}]: unknown field(s) {sorted(unknown_keys)} — only "
+                    "frame/side/time_offset/value_offset are accepted. 'time' and "
+                    "'value' are never editable through this action.",
+                    code="UNKNOWN_HANDLE_FIELD",
+                    state={"unknown_fields": sorted(unknown_keys)},
+                )
+            frame = h.get("frame")
+            side = h.get("side")
+            if not isinstance(frame, (int, float)):
+                return _err(f"handles[{i}]: 'frame' is required and must be numeric", code="INVALID_HANDLE")
+            if side not in ("LH", "RH"):
+                return _err(f"handles[{i}]: 'side' must be 'LH' or 'RH'", code="INVALID_HANDLE")
+            t_off, v_off = h.get("time_offset"), h.get("value_offset")
+            if t_off is None and v_off is None:
+                return _err(
+                    f"handles[{i}]: at least one of time_offset/value_offset is required",
+                    code="MISSING_HANDLE_COMPONENT",
+                )
+            if t_off is not None and not isinstance(t_off, (int, float)):
+                return _err(f"handles[{i}]: time_offset must be numeric", code="INVALID_HANDLE")
+            if v_off is not None and not isinstance(v_off, (int, float)):
+                return _err(f"handles[{i}]: value_offset must be numeric", code="INVALID_HANDLE")
+
+            raw_key = next(
+                (k for k in raw if isinstance(k, (int, float)) and abs(k - frame) < 1e-6), None
+            )
+            if raw_key is None:
+                return _err(
+                    f"handles[{i}]: frame {frame!r} does not exist on this curve "
+                    "(set_spline_handles never creates keyframes)",
+                    code="UNKNOWN_KEYFRAME",
+                    state={"requested_frame": frame, "existing_frames": sorted(raw)},
+                )
+            entry = raw[raw_key]
+            handle = entry.get(side) if isinstance(entry, dict) else None
+            if not isinstance(handle, dict) or 1 not in handle or 2 not in handle:
+                return _err(
+                    f"handles[{i}]: frame {frame!r} has no usable '{side}' handle "
+                    "(set_spline_handles never creates handles)",
+                    code="UNKNOWN_HANDLE",
+                    state={"requested_side": side, "frame_entry": _ser(entry)},
+                )
+            resolved.append((raw_key, side, t_off, v_off))
+
+        # Build the write payload from the CURRENT raw structure -- copy
+        # everything, mutate only the requested numeric keys. Never
+        # reconstructed from get_spline_curve's normalized representation
+        # (see plan_implementacion_set_spline_handles.md for why).
+        raw_modified = copy.deepcopy(raw)
+        for raw_key, side, t_off, v_off in resolved:
+            if t_off is not None:
+                raw_modified[raw_key][side][1] = t_off
+            if v_off is not None:
+                raw_modified[raw_key][side][2] = v_off
+
+        # One write call, exactly the shape validated empirically in Gate
+        # A/B/C (round-trip, RH value_offset, RH time_offset): no
+        # comp.Lock()/StartUndo() wrapping -- that layer was never part of
+        # the path those gates actually exercised, so v1 doesn't add it as
+        # an unvalidated assumption. `replace` intentionally omitted, same
+        # reasoning as the gates.
+        try:
+            modifier_tool.SetKeyFrames(raw_modified)
+        except Exception as exc:
+            return _err(
+                f"BezierSpline.SetKeyFrames() failed: {type(exc).__name__}: {exc}",
+                code="SETKEYFRAMES_FAILED", category="resolve_api_failed",
+            )
+
+        try:
+            raw_after = modifier_tool.GetKeyFrames() or {}
+        except Exception as exc:
+            return _err(
+                f"Write may have succeeded but read-back failed: {exc}",
+                code="READBACK_FAILED", category="resolve_api_failed",
+            )
+
+        # The only correct read-back is exact (tolerant) equality with what
+        # was intended -- one comparison covers count, frames, values,
+        # untouched handles/Flags, AND the requested changes at once.
+        ok, diffs = _fusion_raw_curve_semantically_equal(raw_modified, raw_after)
+        if not ok:
+            return _err(
+                "set_spline_handles: read-back did not match the intended "
+                "curve after SetKeyFrames -- " + "; ".join(diffs),
+                code="READBACK_MISMATCH", category="resolve_api_failed",
+                state={"raw_before": _ser(raw), "raw_after": _ser(raw_after)},
+            )
+
+        points = []
+        for frame in sorted(raw_after):
+            point, problem = _fusion_parse_bezier_point(frame, raw_after[frame])
+            if not problem:
+                points.append(point)
+        return _ok(
+            modifier_type=modifier_type,
+            modifier_name=mod_attrs.get("TOOLS_Name", ""),
+            points=points,
+        )
+
     elif action == "delete_keyframe":
         tool = comp.FindTool(p["tool_name"])
         if not tool:
@@ -25793,7 +26156,7 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
         "add_tool","delete_tool","get_tool_list","find_tool",
         "connect","disconnect","get_inputs","get_outputs",
         "set_input","get_input","set_attrs","get_attrs",
-        "add_keyframe","get_keyframes","delete_keyframe",
+        "add_keyframe","get_keyframes","get_spline_curve","set_spline_handles","delete_keyframe",
         "get_comp_info","set_frame_range","get_frame_range","render",
         "start_undo","end_undo",
         "get_position","set_position","copy_tool","auto_arrange",
