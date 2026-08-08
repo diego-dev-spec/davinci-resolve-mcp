@@ -1624,8 +1624,9 @@ Key actions:
   value_offset}` or `null`). Complements `get_keyframes` (times only). Read-only,
   v1 only supports `BezierSpline` modifiers — errors clearly (does not guess) on
   `Path` or any other connected modifier type, or on a keyframe entry whose shape
-  doesn't match the validated `{value, LH?, RH?, Flags?}` structure. No
-  `SetKeyFrames`/`DeleteKeyFrames`/`AdjustKeyFrames` yet.
+  doesn't match the validated `{value, LH?, RH?, Flags?}` structure. Read-only —
+  see `set_spline_handles`/`delete_keyframe` for writes; `AdjustKeyFrames` still
+  unexplored.
 - `set_spline_handles(tool_name, input_name, handles)` — modify `LH`/`RH` handle
   offsets on an existing `BezierSpline` curve. `handles` is a non-empty list of
   `{frame, side, time_offset?, value_offset?}`; `frame`/`side` must already exist
@@ -1634,6 +1635,15 @@ Key actions:
   `GetKeyFrames()` fresh, mutates a copy, calls `SetKeyFrames()` once (`replace`
   omitted), and verifies the read-back matches the intended curve exactly before
   reporting success.
+- `delete_keyframe(tool_name, input_name, time)` — delete one existing keyframe
+  from a `BezierSpline` curve; `time` must match an existing keyframe or this
+  errors (`UNKNOWN_KEYFRAME`) before writing anything. v1 only supports
+  `BezierSpline` (errors `UNSUPPORTED_MODIFIER` on `Path` or anything else —
+  Point-input deletion isn't supported yet). Calls `DeleteKeyFrames()` once, then
+  verifies the read-back: count drops by exactly 1, the deleted frame is gone,
+  every surviving frame keeps its position and value. Surviving frames' `LH`/`RH`
+  are NOT required to stay identical — Fusion legitimately recalculates
+  neighboring tangents when a keyframe disappears.
 - `get_position(tool_name)` / `set_position(tool_name, x, y)` — read/write a node's
   position on the FlowView canvas; `set_position` returns a position read-back
 - `copy_tool(tool_name, name?, x?, y?)` — duplicate a node (settings copied via a
