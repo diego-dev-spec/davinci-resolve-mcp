@@ -25488,6 +25488,184 @@ def _fusion_delete_keyframe_path_readback_ok(frames_before, frames_after, delete
     return (len(diffs) == 0), diffs
 
 
+def _fusion_add_keyframe_seeded(comp, tool, inp, input_name, requested_time, requested_value, tol=1e-6):
+    """Add the first keyframe on a virgin input via a fresh BezierSpline modifier,
+    without leaving a phantom keyframe behind.
+
+    AddModifier() seeds a keyframe at whatever COMPN_CurrentTime is vigente the
+    moment it's called, using the input's current static value -- empirically
+    confirmed in produccion-visual-dp (Gates 0/0B/A1/A2/A3, see
+    pruebas/keyframe-seed-gate-a-01/resultado.md and
+    pruebas/keyframe-seed-fix-gate-a3-01/). This pins CurrentTime to
+    requested_time before calling AddModifier so the seed lands exactly on the
+    requested frame instead of a separate one, then restores CurrentTime
+    unconditionally before returning.
+
+    Caller must already hold comp.Lock() and call comp.Unlock() afterward --
+    this does not lock/unlock itself. Scope: virgin input + BezierSpline only;
+    the caller has already checked that. No destructive rollback on any
+    failure path -- never DeleteKeyFrames, RemoveModifier, disconnects, or
+    tool deletion. A failure past AddModifier can leave partial state (a
+    connected BezierSpline, possibly a keyframe with the wrong value) --
+    reported via `state`, never silently corrected.
+    """
+    def _approx(a, b):
+        try:
+            return abs(float(a) - float(b)) < tol
+        except (TypeError, ValueError):
+            return False
+
+    try:
+        original_time = comp.CurrentTime
+    except Exception as exc:
+        return _err(
+            f"Could not read Composition.CurrentTime before seeding a keyframe: {exc}",
+            code="CURRENTTIME_UNREADABLE", category="resolve_api_failed",
+            state={"input_name": input_name, "requested_time": requested_time},
+        )
+
+    pin_attempted = not _approx(original_time, requested_time)
+    pin_exception = None
+    if pin_attempted:
+        try:
+            comp.CurrentTime = requested_time
+        except Exception as exc:
+            pin_exception = exc
+
+    def _finish(primary_err):
+        # Cleanup: always attempted once a pin was attempted, even if the
+        # assignment above raised -- it is not assumed atomic, so a partial
+        # mutation before the exception is possible. The final CurrentTime
+        # check runs regardless of pin_attempted (also catches AddModifier or
+        # the keyframe write unexpectedly moving the composition's time).
+        if pin_attempted:
+            try:
+                comp.CurrentTime = original_time
+            except Exception:
+                pass
+        try:
+            final_currenttime = comp.CurrentTime
+            final_compn = (comp.GetAttrs() or {}).get("COMPN_CurrentTime")
+        except Exception:
+            final_currenttime = None
+            final_compn = None
+        restored_ok = _approx(final_currenttime, original_time) and _approx(final_compn, original_time)
+
+        if not restored_ok:
+            # CURRENTTIME_RESTORE_FAILED takes precedence over any primary
+            # error -- an unrestored global CurrentTime is the more severe,
+            # more actionable problem. The primary failure (if any) is kept
+            # in `state`, not lost.
+            state = {
+                "original_time": original_time,
+                "requested_time": requested_time,
+                "pin_attempted": pin_attempted,
+                "final_currenttime": final_currenttime,
+                "final_compn_currenttime": final_compn,
+            }
+            if primary_err is not None:
+                state["primary_error_code"] = primary_err.get("error", {}).get("code")
+                state["primary_error_message"] = primary_err.get("error", {}).get("message")
+            return _err(
+                "Composition.CurrentTime could not be restored/confirmed after add_keyframe",
+                code="CURRENTTIME_RESTORE_FAILED", category="resolve_api_failed", state=state,
+            )
+        return primary_err
+
+    if pin_attempted and pin_exception is not None:
+        err = _err(
+            f"Could not pin Composition.CurrentTime to {requested_time}: {pin_exception}",
+            code="CURRENTTIME_PIN_FAILED", category="resolve_api_failed",
+            state={"requested_time": requested_time, "original_time": original_time},
+        )
+        # _finish() only returns None when called with primary_err=None (the
+        # happy path) -- with a non-None err it always returns non-None
+        # (either err itself, once restoration is confirmed, or a fresh
+        # CURRENTTIME_RESTORE_FAILED that supersedes it).
+        return _finish(err)
+
+    temp_currenttime = comp.CurrentTime
+    temp_compn = (comp.GetAttrs() or {}).get("COMPN_CurrentTime")
+    if not (_approx(temp_currenttime, requested_time) and _approx(temp_compn, requested_time)):
+        err = _err(
+            "Composition.CurrentTime read-back did not confirm requested_time before AddModifier",
+            code="CURRENTTIME_PIN_FAILED", category="resolve_api_failed",
+            state={"requested_time": requested_time, "read_back_currenttime": temp_currenttime,
+                   "read_back_compn_currenttime": temp_compn},
+        )
+        # _finish() only returns None when called with primary_err=None (the
+        # happy path) -- with a non-None err it always returns non-None
+        # (either err itself, once restoration is confirmed, or a fresh
+        # CURRENTTIME_RESTORE_FAILED that supersedes it).
+        return _finish(err)
+
+    # AddModifier's return value is diagnostic only (state, below) -- success
+    # is decided by read-back, not by trusting the return value. No evidence
+    # (Gates A1/A3, existing tests) that a falsy return with BezierSpline
+    # genuinely connected should be treated as failure.
+    addmod_exception = None
+    addmod_return = None
+    try:
+        addmod_return = tool.AddModifier(input_name, "BezierSpline")
+    except Exception as exc:
+        addmod_exception = exc
+
+    output = inp.GetConnectedOutput() if addmod_exception is None else None
+    modifier_tool = output.GetTool() if output else None
+    modifier_regid = (modifier_tool.GetAttrs() or {}).get("TOOLS_RegID") if modifier_tool else None
+
+    if addmod_exception is not None or modifier_regid != "BezierSpline":
+        err = _err(
+            "AddModifier did not result in a connected BezierSpline modifier",
+            code="ADDMODIFIER_FAILED", category="resolve_api_failed",
+            state={"addmodifier_return": repr(addmod_return),
+                   "addmodifier_exception": str(addmod_exception) if addmod_exception else None,
+                   "modifier_regid_observed": modifier_regid},
+        )
+        # _finish() only returns None when called with primary_err=None (the
+        # happy path) -- with a non-None err it always returns non-None
+        # (either err itself, once restoration is confirmed, or a fresh
+        # CURRENTTIME_RESTORE_FAILED that supersedes it).
+        return _finish(err)
+
+    try:
+        tool[input_name][requested_time] = requested_value
+    except Exception as exc:
+        err = _err(
+            f"Failed to write keyframe at {requested_time}: {exc}",
+            code="KEYFRAME_WRITE_FAILED", category="resolve_api_failed",
+            state={"requested_time": requested_time, "requested_value": requested_value},
+        )
+        # _finish() only returns None when called with primary_err=None (the
+        # happy path) -- with a non-None err it always returns non-None
+        # (either err itself, once restoration is confirmed, or a fresh
+        # CURRENTTIME_RESTORE_FAILED that supersedes it).
+        return _finish(err)
+
+    raw = modifier_tool.GetKeyFrames() or {}
+    keys = [k for k in raw if isinstance(k, (int, float))]
+    seed_ok = (
+        len(keys) == 1
+        and _approx(keys[0], requested_time)
+        and _approx((raw.get(keys[0], {}) or {}).get(1), requested_value)
+    )
+    if not seed_ok:
+        err = _err(
+            "BezierSpline.GetKeyFrames() did not match the expected single-keyframe result",
+            code="SEED_POSTCONDITION_MISMATCH", category="resolve_api_failed",
+            state={"raw_keyframes_observed": _ser(raw), "requested_time": requested_time,
+                   "requested_value": requested_value},
+        )
+        # _finish() only returns None when called with primary_err=None (the
+        # happy path) -- with a non-None err it always returns non-None
+        # (either err itself, once restoration is confirmed, or a fresh
+        # CURRENTTIME_RESTORE_FAILED that supersedes it).
+        return _finish(err)
+
+    result = _finish(None)
+    return result if result is not None else _ok()
+
+
 @mcp.tool()
 @_guard_missing_params
 def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -25825,8 +26003,18 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
                 _already_animated = inp.GetConnectedOutput() is not None
             except Exception:
                 _already_animated = False
+            modifier_target = p.get("modifier", "BezierSpline")
+            if not _already_animated and modifier_target == "BezierSpline":
+                # AddModifier() seeds a keyframe at whatever COMPN_CurrentTime is
+                # vigente at call time (pruebas/keyframe-seed-gate-a-01 in
+                # produccion-visual-dp, Gates A1/A2). Route through the
+                # CurrentTime-pinning helper so that seed lands on the
+                # requested frame instead of leaving a phantom keyframe behind.
+                # Scoped to BezierSpline only -- Path's write mechanism is
+                # structurally different and untested for this behavior.
+                return _fusion_add_keyframe_seeded(comp, tool, inp, p["input_name"], p["time"], p["value"])
             if not _already_animated:
-                tool.AddModifier(p["input_name"], p.get("modifier", "BezierSpline"))
+                tool.AddModifier(p["input_name"], modifier_target)
             tool[p["input_name"]][p["time"]] = p["value"]
             return _ok()
         finally:
