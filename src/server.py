@@ -25410,6 +25410,52 @@ def _fusion_raw_curve_semantically_equal(a, b, tol=1e-6):
     return (len(diffs) == 0), diffs
 
 
+def _fusion_delete_keyframe_readback_ok(raw_before, raw_after, deleted_key, tol=1e-6):
+    """Verify a BezierSpline.DeleteKeyFrames() read-back matches what deleting
+    exactly one keyframe should produce.
+
+    Unlike _fusion_raw_curve_semantically_equal (used by set_spline_handles,
+    which must preserve handles exactly), this deliberately does NOT compare
+    LH/RH/Flags: Gate A (pruebas/keyframe-delete-lab-01) demonstrated Fusion
+    legitimately recalculates neighboring tangents when a keyframe
+    disappears, so requiring handle equality here would fail the expected
+    happy path. Only keyframe count (-1), frame positions, and values on the
+    surviving frames are checked.
+
+    Returns (ok, diffs) -- diffs lists every mismatch found.
+    """
+    diffs = []
+    before_keys = sorted((k for k in raw_before if isinstance(k, (int, float))), key=float)
+    after_keys = sorted((k for k in raw_after if isinstance(k, (int, float))), key=float)
+
+    if len(after_keys) != len(before_keys) - 1:
+        diffs.append(
+            f"keyframe count should drop by exactly 1: {len(before_keys)} -> "
+            f"expected {len(before_keys) - 1}, got {len(after_keys)}"
+        )
+        return False, diffs
+
+    if any(abs(float(k) - float(deleted_key)) < tol for k in after_keys):
+        diffs.append(f"frame {deleted_key!r} still present after deletion")
+        return False, diffs
+
+    expected_keys = [k for k in before_keys if abs(float(k) - float(deleted_key)) >= tol]
+    for ek, ak in zip(expected_keys, after_keys):
+        if abs(float(ek) - float(ak)) > tol:
+            diffs.append(f"surviving frame differs: expected {ek!r}, got {ak!r}")
+            continue
+        eb, ea = raw_before[ek], raw_after[ak]
+        ev = eb.get(1) if isinstance(eb, dict) else None
+        av = ea.get(1) if isinstance(ea, dict) else None
+        if ev is None or av is None:
+            if ev != av:
+                diffs.append(f"frame {ek!r}: value missing on one side ({ev!r} vs {av!r})")
+        elif abs(float(ev) - float(av)) > tol:
+            diffs.append(f"frame {ek!r}: value changed {ev!r} -> {av!r}")
+
+    return (len(diffs) == 0), diffs
+
+
 @mcp.tool()
 @_guard_missing_params
 def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -25457,7 +25503,19 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
         keys on a copy, calls SetKeyFrames() once (replace omitted), then verifies
         the read-back matches the intended curve exactly before reporting success —
         any mismatch is a hard error, never a silent partial write.
-      delete_keyframe(tool_name, input_name, time) -> {success}
+      delete_keyframe(tool_name, input_name, time) -> {success, modifier_type, modifier_name, points}
+        Delete one EXISTING keyframe from a BezierSpline curve (v1 only supports
+        BezierSpline — errors with UNSUPPORTED_MODIFIER on Path or anything else,
+        same as get_spline_curve/set_spline_handles). `time` must match an
+        existing keyframe or this errors with UNKNOWN_KEYFRAME before writing
+        anything. Locates the modifier the same way as get_spline_curve/
+        set_spline_handles (Input.GetConnectedOutput() -> Output.GetTool(),
+        gated on TOOLS_RegID), calls BezierSpline.DeleteKeyFrames() once, then
+        verifies the read-back: keyframe count must drop by exactly 1, the
+        deleted frame must be gone, and every surviving frame must keep its
+        position and value. Surviving frames' LH/RH handles are NOT required
+        to stay identical — Fusion legitimately recalculates neighboring
+        tangents when a keyframe disappears; that is not treated as failure.
       get_comp_info() -> {name, tool_count, attrs}
       get_position(tool_name) -> {tool_name, x, y}  — read a node's FlowView position
       set_position(tool_name, x, y) -> {success, x, y, readback}  — move a node
@@ -25989,15 +26047,119 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
         tool = comp.FindTool(p["tool_name"])
         if not tool:
             return _err(f"Tool '{p['tool_name']}' not found")
-        comp.Lock()
+        inp = tool[p["input_name"]]
+        if not inp:
+            return _err(f"Input '{p['input_name']}' not found on tool '{p['tool_name']}'")
+
+        # Same pure localization as get_spline_curve/set_spline_handles -- no
+        # FindTool()-by-name fallback. The previous implementation called
+        # Input.RemoveKeyFrame(time), a method with no evidence of existing
+        # on that object; it silently resolved to None and every call raised
+        # "'NoneType' object is not callable" (see keyframe-delete-lab-01).
+        # The correct target is the BezierSpline Tool modifier itself.
         try:
-            inp = tool[p["input_name"]]
-            if not inp:
-                return _err(f"Input '{p['input_name']}' not found on tool '{p['tool_name']}'")
-            inp.RemoveKeyFrame(p["time"])
-            return _ok()
-        finally:
-            comp.Unlock()
+            output = inp.GetConnectedOutput()
+        except Exception as exc:
+            return _err(f"GetConnectedOutput() failed: {exc}", category="resolve_api_failed")
+        if output is None:
+            return _err(
+                f"Input '{p['input_name']}' on '{p['tool_name']}' is not animated "
+                "(no connected modifier)",
+                code="NOT_ANIMATED", category="invalid_input",
+            )
+        try:
+            modifier_tool = output.GetTool()
+        except Exception as exc:
+            return _err(f"GetTool() failed: {exc}", category="resolve_api_failed")
+        if modifier_tool is None:
+            return _err("Connected output has no owning Tool", category="resolve_api_failed")
+
+        mod_attrs = modifier_tool.GetAttrs() or {}
+        modifier_type = mod_attrs.get("TOOLS_RegID")
+        if modifier_type != "BezierSpline":
+            return _err(
+                f"Connected modifier is '{modifier_type}', not 'BezierSpline' — "
+                "delete_keyframe only supports BezierSpline in v1 (e.g. Point "
+                "inputs animated via modifier='Path' are not supported yet)",
+                code="UNSUPPORTED_MODIFIER", category="invalid_input",
+                state={"modifier_type": modifier_type},
+            )
+
+        frame = p.get("time")
+        if not isinstance(frame, (int, float)):
+            return _err("delete_keyframe requires numeric params.time", code="INVALID_PARAM")
+
+        try:
+            raw_before = modifier_tool.GetKeyFrames()
+        except Exception as exc:
+            return _err(f"BezierSpline.GetKeyFrames() failed: {exc}", category="resolve_api_failed")
+        raw_before = raw_before or {}
+
+        raw_key = next(
+            (k for k in raw_before if isinstance(k, (int, float)) and abs(k - frame) < 1e-6), None
+        )
+        if raw_key is None:
+            return _err(
+                f"frame {frame!r} does not exist on this curve",
+                code="UNKNOWN_KEYFRAME",
+                state={"requested_frame": frame, "existing_frames": sorted(raw_before)},
+            )
+
+        # One write call, no comp.Lock()/StartUndo() wrapping -- same
+        # reasoning as set_spline_handles: that layer was never part of the
+        # path Gate A actually exercised (pruebas/keyframe-delete-lab-01), so
+        # v1 doesn't add it as an unvalidated assumption.
+        try:
+            modifier_tool.DeleteKeyFrames(raw_key)
+        except Exception as exc:
+            return _err(
+                f"BezierSpline.DeleteKeyFrames() failed: {type(exc).__name__}: {exc}",
+                code="DELETEKEYFRAMES_FAILED", category="resolve_api_failed",
+            )
+
+        try:
+            raw_after = modifier_tool.GetKeyFrames() or {}
+        except Exception as exc:
+            return _err(
+                f"Deletion may have succeeded but read-back failed: {exc}",
+                code="READBACK_FAILED", category="resolve_api_failed",
+            )
+
+        # Deliberately does NOT require LH/RH/Flags equality on surviving
+        # frames -- Gate A confirmed Fusion legitimately recalculates
+        # neighboring tangents when a keyframe disappears. Only keyframe
+        # count (-1), frame positions, and values are checked.
+        ok, diffs = _fusion_delete_keyframe_readback_ok(raw_before, raw_after, raw_key)
+        if not ok:
+            return _err(
+                "delete_keyframe: read-back did not match the expected result "
+                "after DeleteKeyFrames -- " + "; ".join(diffs),
+                code="READBACK_MISMATCH", category="resolve_api_failed",
+                state={"raw_before": _ser(raw_before), "raw_after": _ser(raw_after)},
+            )
+
+        points = []
+        problems = []
+        for f in sorted(raw_after):
+            point, problem = _fusion_parse_bezier_point(f, raw_after[f])
+            if problem:
+                problems.append(problem)
+            else:
+                points.append(point)
+        if problems:
+            return _err(
+                "delete_keyframe: BezierSpline.GetKeyFrames() after deletion "
+                "returned a shape that doesn't match the validated structure: "
+                + "; ".join(problems),
+                code="UNPARSEABLE_CURVE", category="resolve_api_failed",
+                state={"raw_curve": _ser(raw_after)},
+            )
+
+        return _ok(
+            modifier_type=modifier_type,
+            modifier_name=mod_attrs.get("TOOLS_Name", ""),
+            points=points,
+        )
 
     # --- Composition Control ---
     elif action == "get_comp_info":

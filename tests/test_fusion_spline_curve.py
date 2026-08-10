@@ -108,6 +108,29 @@ class FakeWritableModifierTool(FakeModifierTool):
         return None  # empirically confirmed return value — see Gate A/B/C
 
 
+class FakeDeletableModifierTool(FakeModifierTool):
+    """FakeModifierTool with a working DeleteKeyFrames(frame). delete_keyframe
+    always re-reads via GetKeyFrames() immediately after deleting, so the
+    fake must actually reflect the deletion for read-back verification to be
+    exercised meaningfully."""
+
+    def __init__(self, *args, raise_on_delete_keyframes=None, corrupt_after_delete=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._raise_on_delete = raise_on_delete_keyframes
+        self._corrupt_after_delete = corrupt_after_delete
+        self.delete_keyframes_calls = []
+
+    def DeleteKeyFrames(self, frame):
+        self.delete_keyframes_calls.append(frame)
+        if self._raise_on_delete is not None:
+            raise self._raise_on_delete
+        if self._corrupt_after_delete is not None:
+            self._keyframes = self._corrupt_after_delete
+        else:
+            self._keyframes = {k: v for k, v in self._keyframes.items() if k != frame}
+        return None  # empirically confirmed return value — see Gate A (delete)
+
+
 def _dispatch(comp, params):
     with mock.patch.object(s, "_resolve_fusion_comp", return_value=(comp, None)):
         return s.fusion_comp("get_spline_curve", params)
@@ -118,12 +141,33 @@ def _dispatch_set(comp, params):
         return s.fusion_comp("set_spline_handles", params)
 
 
+def _dispatch_delete(comp, params):
+    with mock.patch.object(s, "_resolve_fusion_comp", return_value=(comp, None)):
+        return s.fusion_comp("delete_keyframe", params)
+
+
 # Raw shape captured empirically from BezierSpline.GetKeyFrames() against a
 # real 2-keyframe linear curve (Transform_Lab.Size, frame 0=0.5, frame 60=1.5),
 # see pruebas/keyframe-easing-lab-01/resultado_validacion_nativa.md:
 #   {0.0: {1: 0.5, 'RH': {1: 20.0, 2: 0.333...}},
 #    60.0: {1: 1.5, 'LH': {1: -20.0, 2: -0.333...}}}
 REAL_RAW_CURVE = {
+    0.0: {1: 0.5, "RH": {1: 20.0, 2: 0.33333333333333326}},
+    60.0: {1: 1.5, "LH": {1: -20.0, 2: -0.3333333333333335}},
+}
+
+# Raw shape captured empirically from a 3-keyframe curve before deletion,
+# see pruebas/keyframe-delete-lab-01/resultado_gate_a_native_delete_keyframes.md:
+#   Transform_Lab.Size, frame 0=0.5, frame 30=1.0, frame 60=1.5.
+THREE_KEYFRAME_RAW_CURVE = {
+    0.0: {1: 0.5, "RH": {1: 10.0, 2: 0.16666666666666663}},
+    30.0: {1: 1.0, "LH": {1: -10.0, 2: -0.16666666666666674}, "RH": {1: 10.0, 2: 0.16666666666666674}},
+    60.0: {1: 1.5, "LH": {1: -10.0, 2: -0.16666666666666674}},
+}
+
+# Same curve after Gate A actually deleted frame 30.0 against live Resolve --
+# handles on 0/60 legitimately recalculated, values unchanged.
+THREE_KEYFRAME_RAW_CURVE_AFTER_DELETE_30 = {
     0.0: {1: 0.5, "RH": {1: 20.0, 2: 0.33333333333333326}},
     60.0: {1: 1.5, "LH": {1: -20.0, 2: -0.3333333333333335}},
 }
@@ -483,6 +527,136 @@ class SetSplineHandlesTests(unittest.TestCase):
         # frame 0 value/RH[1] untouched
         self.assertEqual(modifier._keyframes[0.0][1], 0.5)
         self.assertEqual(modifier._keyframes[0.0]["RH"][1], 20.0)
+
+
+class DeleteKeyframeTests(unittest.TestCase):
+    """delete_keyframe v1: delete one EXISTING keyframe from a BezierSpline
+    curve only. Gate A (pruebas/keyframe-delete-lab-01) already validated
+    BezierSpline.DeleteKeyFrames() itself empirically against live Resolve,
+    including that neighboring LH/RH handles legitimately change; these
+    tests exercise the wrapper's own logic (localization, validation-before-
+    write, read-back verification that ignores handle drift) against a fake
+    bridge."""
+
+    def _fresh_curve(self):
+        return copy.deepcopy(THREE_KEYFRAME_RAW_CURVE)
+
+    def _deletable_bezier(self, keyframes, raise_on_delete_keyframes=None,
+                           corrupt_after_delete=None, modifier_regid="BezierSpline"):
+        modifier = FakeDeletableModifierTool(
+            modifier_regid, name="Transform_LabSize", keyframes=keyframes,
+            raise_on_delete_keyframes=raise_on_delete_keyframes,
+            corrupt_after_delete=corrupt_after_delete,
+        )
+        output = FakeOutput(tool=modifier)
+        inp = FakeInput(connected_output=output)
+        tool = FakeTool({"Size": inp})
+        comp = FakeComp({"Transform1": tool})
+        return comp, modifier
+
+    def test_deletes_intermediate_frame(self):
+        comp, modifier = self._deletable_bezier(self._fresh_curve())
+        out = _dispatch_delete(comp, {
+            "tool_name": "Transform1", "input_name": "Size", "time": 30.0,
+        })
+        self.assertTrue(out.get("success"), out)
+        self.assertEqual(modifier.delete_keyframes_calls, [30.0])
+        self.assertNotIn(30.0, modifier._keyframes)
+        by_time = {pt["time"]: pt for pt in out["points"]}
+        self.assertEqual(set(by_time), {0.0, 60.0})
+        self.assertAlmostEqual(by_time[0.0]["value"], 0.5, places=9)
+        self.assertAlmostEqual(by_time[60.0]["value"], 1.5, places=9)
+
+    def test_unknown_frame_rejected_before_write(self):
+        comp, modifier = self._deletable_bezier(self._fresh_curve())
+        out = _dispatch_delete(comp, {
+            "tool_name": "Transform1", "input_name": "Size", "time": 45.0,
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "UNKNOWN_KEYFRAME")
+        self.assertEqual(modifier.delete_keyframes_calls, [])  # never wrote
+
+    def test_deletekeyframes_exception_is_failure(self):
+        comp, modifier = self._deletable_bezier(
+            self._fresh_curve(), raise_on_delete_keyframes=RuntimeError("boom"),
+        )
+        out = _dispatch_delete(comp, {
+            "tool_name": "Transform1", "input_name": "Size", "time": 30.0,
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "DELETEKEYFRAMES_FAILED")
+
+    def test_readback_frame_still_present_is_failure(self):
+        # Simulate DeleteKeyFrames() being a no-op -- the requested frame is
+        # still there afterwards.
+        comp, modifier = self._deletable_bezier(
+            self._fresh_curve(), corrupt_after_delete=self._fresh_curve(),
+        )
+        out = _dispatch_delete(comp, {
+            "tool_name": "Transform1", "input_name": "Size", "time": 30.0,
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "READBACK_MISMATCH")
+
+    def test_readback_wrong_frame_deleted_is_failure(self):
+        # Frame 30 (requested) is still present; frame 0 (not requested)
+        # disappeared instead.
+        wrong = self._fresh_curve()
+        del wrong[0.0]
+        comp, modifier = self._deletable_bezier(self._fresh_curve(), corrupt_after_delete=wrong)
+        out = _dispatch_delete(comp, {
+            "tool_name": "Transform1", "input_name": "Size", "time": 30.0,
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "READBACK_MISMATCH")
+
+    def test_readback_value_changed_on_remaining_frame_is_failure(self):
+        # Frame 30 correctly gone, but frame 60's value was corrupted too.
+        corrupted = copy.deepcopy(THREE_KEYFRAME_RAW_CURVE_AFTER_DELETE_30)
+        corrupted[60.0][1] = 999.0
+        comp, modifier = self._deletable_bezier(self._fresh_curve(), corrupt_after_delete=corrupted)
+        out = _dispatch_delete(comp, {
+            "tool_name": "Transform1", "input_name": "Size", "time": 30.0,
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "READBACK_MISMATCH")
+
+    def test_legitimate_handle_recalculation_does_not_fail(self):
+        # This is the Gate A finding: deleting frame 30 legitimately changes
+        # the RH of frame 0 and the LH of frame 60. Must NOT be treated as
+        # a read-back mismatch.
+        comp, modifier = self._deletable_bezier(
+            self._fresh_curve(),
+            corrupt_after_delete=copy.deepcopy(THREE_KEYFRAME_RAW_CURVE_AFTER_DELETE_30),
+        )
+        out = _dispatch_delete(comp, {
+            "tool_name": "Transform1", "input_name": "Size", "time": 30.0,
+        })
+        self.assertTrue(out.get("success"), out)
+        by_time = {pt["time"]: pt for pt in out["points"]}
+        self.assertAlmostEqual(by_time[0.0]["rh"]["time_offset"], 20.0, places=9)
+        self.assertAlmostEqual(by_time[60.0]["lh"]["time_offset"], -20.0, places=9)
+
+    def test_modifier_path_rejected(self):
+        comp, modifier = self._deletable_bezier(
+            {0.0: {1: [0.5, 0.5]}, 30.0: {1: [1.0, 1.0]}}, modifier_regid="Path",
+        )
+        out = _dispatch_delete(comp, {
+            "tool_name": "Transform1", "input_name": "Size", "time": 30.0,
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "UNSUPPORTED_MODIFIER")
+        self.assertEqual(modifier.delete_keyframes_calls, [])
+
+    def test_unknown_modifier_type_rejected(self):
+        comp, modifier = self._deletable_bezier(self._fresh_curve(), modifier_regid="SomeOtherModifier")
+        out = _dispatch_delete(comp, {
+            "tool_name": "Transform1", "input_name": "Size", "time": 30.0,
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "UNSUPPORTED_MODIFIER")
+        self.assertEqual(out["error"]["state"]["modifier_type"], "SomeOtherModifier")
+        self.assertEqual(modifier.delete_keyframes_calls, [])
 
 
 if __name__ == "__main__":
