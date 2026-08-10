@@ -63,6 +63,11 @@ class FakeTool:
     def __getitem__(self, name):
         return self._inputs.get(name)
 
+    def GetInput(self, name, time):
+        # Only used by delete_keyframe's Path branch, via FakePathInput's
+        # own value store, so surviving-frame values reflect any prior write.
+        return self._inputs[name].get_value(time)
+
 
 class FakeComp:
     def __init__(self, tools):
@@ -131,6 +136,82 @@ class FakeDeletableModifierTool(FakeModifierTool):
         return None  # empirically confirmed return value — see Gate A (delete)
 
 
+class FakePathModifierTool(FakeModifierTool):
+    """Stand-in for the Fusion Tool object behind a Path modifier (animates a
+    Point input). GetKeyFrames() returns {index: time} -- NOT {time: value}
+    like BezierSpline -- empirically confirmed, see
+    pruebas/keyframe-path-delete-lab-01/resultado.md."""
+
+    def __init__(self, times, name="Path1", regid="Path"):
+        super().__init__(regid, name=name)
+        self._times = sorted(times)
+
+    def GetKeyFrames(self):
+        return {i + 1: t for i, t in enumerate(self._times)}
+
+
+_UNSET = object()  # sentinel: distinguishes "not passed" from an explicit None
+
+
+class FakePathInput:
+    """Stand-in for a Point Input animated via a Path modifier. Supports the
+    validated native deletion mechanism (Input[time] = None) -- see
+    pruebas/keyframe-path-delete-lab-01/resultado.md. No DeleteKeyFrames()
+    equivalent exists on Path (empirically confirmed: calling it raises
+    TypeError: 'NoneType' object is not callable), so delete_keyframe's Path
+    branch never calls it."""
+
+    def __init__(self, connected_output, values, raise_on_setitem=None,
+                 connected_output_after=_UNSET, corrupt_times_after=None,
+                 corrupt_value_at=None):
+        self._connected_output = connected_output
+        # _UNSET (default) means "unchanged" -- most tests want
+        # GetConnectedOutput() to keep returning the same output after the
+        # write. An explicit None means "lost the connection entirely" and
+        # must be distinguishable from "not passed" at all.
+        self._connected_output_after = (
+            connected_output if connected_output_after is _UNSET else connected_output_after
+        )
+        self._values = dict(values)
+        self._raise_on_setitem = raise_on_setitem
+        self._corrupt_times_after = corrupt_times_after
+        self._corrupt_value_at = corrupt_value_at
+        self.setitem_calls = []
+        self._written = False
+
+    def __bool__(self):
+        return True
+
+    def GetAttrs(self):
+        return {"INPS_DataType": "Point"}
+
+    def GetConnectedOutput(self):
+        return self._connected_output_after if self._written else self._connected_output
+
+    def get_value(self, time):
+        return self._values.get(time)
+
+    def __setitem__(self, time, value):
+        self.setitem_calls.append((time, value))
+        if self._raise_on_setitem is not None:
+            # Exception happens before any mutation -- must not leave a
+            # false partial write behind.
+            raise self._raise_on_setitem
+        self._written = True
+        if value is None:
+            if self._corrupt_times_after is not None:
+                modifier = self._connected_output.GetTool() if self._connected_output else None
+                if modifier is not None:
+                    modifier._times = list(self._corrupt_times_after)
+            else:
+                self._values.pop(time, None)
+                modifier = self._connected_output.GetTool() if self._connected_output else None
+                if modifier is not None:
+                    modifier._times = [t for t in modifier._times if abs(t - time) > 1e-9]
+            if self._corrupt_value_at is not None:
+                self._values.update(self._corrupt_value_at)
+
+
 def _dispatch(comp, params):
     with mock.patch.object(s, "_resolve_fusion_comp", return_value=(comp, None)):
         return s.fusion_comp("get_spline_curve", params)
@@ -170,6 +251,15 @@ THREE_KEYFRAME_RAW_CURVE = {
 THREE_KEYFRAME_RAW_CURVE_AFTER_DELETE_30 = {
     0.0: {1: 0.5, "RH": {1: 20.0, 2: 0.33333333333333326}},
     60.0: {1: 1.5, "LH": {1: -20.0, 2: -0.3333333333333335}},
+}
+
+# Point values captured empirically from a 3-keyframe Path curve before
+# deletion, see pruebas/keyframe-path-delete-lab-01/resultado.md:
+#   Transform_Lab.Center, frame 0=[0.2,0.2], 30=[0.5,0.8], 60=[0.8,0.2].
+PATH_THREE_KEYFRAME_VALUES = {
+    0.0: {1: 0.2, 2: 0.2, 3: 0.0},
+    30.0: {1: 0.5, 2: 0.8, 3: 0.0},
+    60.0: {1: 0.8, 2: 0.2, 3: 0.0},
 }
 
 
@@ -637,9 +727,15 @@ class DeleteKeyframeTests(unittest.TestCase):
         self.assertAlmostEqual(by_time[0.0]["rh"]["time_offset"], 20.0, places=9)
         self.assertAlmostEqual(by_time[60.0]["lh"]["time_offset"], -20.0, places=9)
 
-    def test_modifier_path_rejected(self):
+    def test_modifier_still_rejected_when_neither_bezierspline_nor_path(self):
+        # Was originally written with modifier_regid="Path" back when Path
+        # was categorically unsupported. Path now has its own branch (see
+        # DeleteKeyframePathPointTests below), so this must exercise a
+        # genuinely unsupported modifier instead -- distinct from
+        # test_unknown_modifier_type_rejected's own placeholder name, so the
+        # two tests aren't byte-identical.
         comp, modifier = self._deletable_bezier(
-            {0.0: {1: [0.5, 0.5]}, 30.0: {1: [1.0, 1.0]}}, modifier_regid="Path",
+            {0.0: {1: [0.5, 0.5]}, 30.0: {1: [1.0, 1.0]}}, modifier_regid="CustomModifier",
         )
         out = _dispatch_delete(comp, {
             "tool_name": "Transform1", "input_name": "Size", "time": 30.0,
@@ -657,6 +753,136 @@ class DeleteKeyframeTests(unittest.TestCase):
         self.assertEqual(out["error"]["code"], "UNSUPPORTED_MODIFIER")
         self.assertEqual(out["error"]["state"]["modifier_type"], "SomeOtherModifier")
         self.assertEqual(modifier.delete_keyframes_calls, [])
+
+
+class DeleteKeyframePathPointTests(unittest.TestCase):
+    """delete_keyframe v1 Path branch: delete one EXISTING keyframe from a
+    Path modifier animating a Point input, using the natively-validated
+    mechanism Input[time] = None (no DeleteKeyFrames() equivalent exists on
+    Path -- see pruebas/keyframe-path-delete-lab-01/resultado.md). These
+    tests exercise the wrapper's own logic against a fake bridge; Gate A
+    already validated the native mechanism itself against live Resolve."""
+
+    def _deletable_path(self, times=None, values=None, input_type="Point",
+                         raise_on_setitem=None, connected_output_after=_UNSET,
+                         corrupt_times_after=None, corrupt_value_at=None):
+        times = sorted(PATH_THREE_KEYFRAME_VALUES) if times is None else times
+        values = copy.deepcopy(PATH_THREE_KEYFRAME_VALUES) if values is None else values
+        modifier = FakePathModifierTool(times)
+        output = FakeOutput(tool=modifier)
+        inp = FakePathInput(
+            connected_output=output, values=values,
+            raise_on_setitem=raise_on_setitem,
+            connected_output_after=connected_output_after,
+            corrupt_times_after=corrupt_times_after,
+            corrupt_value_at=corrupt_value_at,
+        )
+        if input_type != "Point":
+            inp.GetAttrs = lambda: {"INPS_DataType": input_type}
+        tool = FakeTool({"Center": inp})
+        comp = FakeComp({"Transform1": tool})
+        return comp, modifier, inp
+
+    # --- A: PASS ---
+    def test_deletes_intermediate_frame(self):
+        comp, modifier, inp = self._deletable_path()
+        out = _dispatch_delete(comp, {
+            "tool_name": "Transform1", "input_name": "Center", "time": 30.0,
+        })
+        self.assertTrue(out.get("success"), out)
+        self.assertEqual(inp.setitem_calls, [(30.0, None)])  # single write
+        self.assertEqual(modifier._times, [0.0, 60.0])
+        by_time = {pt["time"]: pt for pt in out["points"]}
+        self.assertEqual(set(by_time), {0.0, 60.0})
+        self.assertEqual(by_time[0.0]["value"], {1: 0.2, 2: 0.2, 3: 0.0})
+        self.assertEqual(by_time[60.0]["value"], {1: 0.8, 2: 0.2, 3: 0.0})
+        for pt in out["points"]:
+            self.assertNotIn("lh", pt)
+            self.assertNotIn("rh", pt)
+            self.assertNotIn("flags", pt)
+
+    # --- B: frame inexistente ---
+    def test_unknown_frame_rejected_before_write(self):
+        comp, modifier, inp = self._deletable_path()
+        out = _dispatch_delete(comp, {
+            "tool_name": "Transform1", "input_name": "Center", "time": 45.0,
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "UNKNOWN_KEYFRAME")
+        self.assertEqual(inp.setitem_calls, [])
+
+    # --- C: modifier Path sobre input no-Point ---
+    def test_non_point_input_rejected(self):
+        comp, modifier, inp = self._deletable_path(input_type="Number")
+        out = _dispatch_delete(comp, {
+            "tool_name": "Transform1", "input_name": "Center", "time": 30.0,
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "UNSUPPORTED_MODIFIER")
+        self.assertEqual(inp.setitem_calls, [])
+
+    # --- D: excepcion durante inp[frame] = None ---
+    def test_assignment_exception_is_failure(self):
+        comp, modifier, inp = self._deletable_path(raise_on_setitem=RuntimeError("boom"))
+        out = _dispatch_delete(comp, {
+            "tool_name": "Transform1", "input_name": "Center", "time": 30.0,
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "INPUT_KEYFRAME_DELETE_FAILED")
+        self.assertFalse(out.get("success"))
+        self.assertEqual(modifier._times, [0.0, 30.0, 60.0])  # untouched
+
+    # --- E: read-back incorrecto ---
+    def test_readback_frame_still_present_is_failure(self):
+        # Simulate the assignment being a no-op -- times unchanged.
+        comp, modifier, inp = self._deletable_path(corrupt_times_after=[0.0, 30.0, 60.0])
+        out = _dispatch_delete(comp, {
+            "tool_name": "Transform1", "input_name": "Center", "time": 30.0,
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "READBACK_MISMATCH")
+
+    def test_readback_new_frame_appears_is_failure(self):
+        # Count is right (2), but the surviving frame at 60 was replaced by
+        # an unexpected frame at 45 instead.
+        comp, modifier, inp = self._deletable_path(corrupt_times_after=[0.0, 45.0])
+        out = _dispatch_delete(comp, {
+            "tool_name": "Transform1", "input_name": "Center", "time": 30.0,
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "READBACK_MISMATCH")
+
+    def test_readback_value_changed_on_remaining_frame_is_failure(self):
+        # Frame 30 correctly gone, but frame 60's value was corrupted too.
+        comp, modifier, inp = self._deletable_path(
+            corrupt_value_at={60.0: {1: 999.0, 2: 0.2, 3: 0.0}},
+        )
+        out = _dispatch_delete(comp, {
+            "tool_name": "Transform1", "input_name": "Center", "time": 30.0,
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "READBACK_MISMATCH")
+
+    def test_readback_modifier_disconnected_is_failure(self):
+        # Input lost its connected modifier entirely after the write.
+        comp, modifier, inp = self._deletable_path(connected_output_after=None)
+        out = _dispatch_delete(comp, {
+            "tool_name": "Transform1", "input_name": "Center", "time": 30.0,
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "READBACK_MISMATCH")
+
+    def test_readback_modifier_type_changed_is_failure(self):
+        # Connected modifier is no longer Path after the write.
+        other_modifier = FakeModifierTool("SomeOtherModifier", name="Mod1")
+        comp, modifier, inp = self._deletable_path(
+            connected_output_after=FakeOutput(tool=other_modifier),
+        )
+        out = _dispatch_delete(comp, {
+            "tool_name": "Transform1", "input_name": "Center", "time": 30.0,
+        })
+        self.assertIn("error", out)
+        self.assertEqual(out["error"]["code"], "READBACK_MISMATCH")
 
 
 if __name__ == "__main__":
