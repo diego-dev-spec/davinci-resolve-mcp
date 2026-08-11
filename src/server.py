@@ -14,6 +14,7 @@ Usage:
 VERSION = "2.93.0"
 
 import base64
+import collections
 import copy
 import os
 import sys
@@ -2590,6 +2591,215 @@ def _get_fusion_comp_on_timeline_item(item, p: Dict[str, Any]):
     if not comp:
         return None, _err(f"GetFusionCompByIndex({comp_index}) returned no composition")
     return comp, None
+
+
+def _fusion_comp_count_or_none(item) -> Optional[int]:
+    """GetFusionCompCount() as an int, or None when it cannot be read.
+
+    None means "unknown", never "zero": callers that verify a mutation by
+    counting must treat an unreadable count as an unverifiable state rather
+    than as an empty item.
+    """
+    try:
+        raw = item.GetFusionCompCount()
+    except Exception as exc:
+        logger.debug("GetFusionCompCount raised: %s", exc)
+        return None
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.debug("GetFusionCompCount returned non-numeric %r", raw)
+        return None
+
+
+def _fusion_comp_name_list(item) -> Optional[List[str]]:
+    """GetFusionCompNameList() normalised to a list of names, or None if unreadable.
+
+    The bridge hands back an empty Lua table as an empty DICT and a populated
+    one as a list (measured on Studio 20.2.1.6), so a caller that assumes "list
+    or None" silently mishandles the zero-comp case.
+    """
+    try:
+        raw = item.GetFusionCompNameList()
+    except Exception as exc:
+        logger.debug("GetFusionCompNameList raised: %s", exc)
+        return None
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return [str(v) for v in raw.values()]
+    if isinstance(raw, (list, tuple)):
+        return [str(v) for v in raw]
+    logger.debug("GetFusionCompNameList returned unexpected shape %r", type(raw).__name__)
+    return None
+
+
+def _fusion_identify_created_comp(
+    names_before: Optional[List[str]], names_after: Optional[List[str]],
+) -> Optional[str]:
+    """Name of the single comp that appeared, or None when not identifiable.
+
+    Best-effort identification only — never a success criterion. Comp names are
+    not unique (rename_comp exists), so this compares MULTISETS: a set
+    difference would report nothing for ['X'] -> ['X', 'X'], which is a real
+    creation. Returns None whenever the diff is not exactly one added name, so
+    an ambiguous answer is reported as unknown rather than guessed.
+    """
+    if names_before is None or names_after is None:
+        return None
+    added = collections.Counter(names_after) - collections.Counter(names_before)
+    if sum(added.values()) != 1:
+        return None
+    return next(iter(added))
+
+
+_ADD_COMP_INSPECT_FIRST = (
+    "Read timeline_item_fusion(action='get_comp_count') and "
+    "(action='get_comp_names') on this item to establish what actually exists, "
+    "then decide deliberately whether to call add_comp again. Do NOT retry "
+    "blindly: AddFusionComp always appends a NEW comp, so a retry after a comp "
+    "was in fact created leaves the item with two."
+)
+
+
+def _add_fusion_comp_verified(item) -> Dict[str, Any]:
+    """AddFusionComp() judged by the item's real comp count, not by its return.
+
+    Measured on Studio 20.2.1.6 (pruebas/add-comp-gate-01 in the lab repo):
+    AddFusionComp() returns None on a "Solid Color" GENERATOR item while
+    creating the comp anyway, and returns the comp object on a media-backed
+    clip. The documented contract is `AddFusionComp() --> fusionComp`, so the
+    return value cannot be used as a success signal for every item type — the
+    old `_ok() if comp else _err(...)` reported a false failure on generators,
+    and its retryable error invited a retry that appended a SECOND comp.
+
+    Success is therefore defined solely as count_after == count_before + 1.
+    The native return value, and any exception it raised, are reported as
+    diagnostics. An exception with a verified +1 is still success: the real
+    state of Resolve outranks the return mechanism.
+
+    Retryable is true ONLY when the baseline read failed and AddFusionComp was
+    consequently never invoked. Once it has been invoked, any outcome other
+    than a verified +1 is non-retryable — the caller must inspect first,
+    because a blind retry is exactly what duplicated comps in the field.
+    """
+    count_before = _fusion_comp_count_or_none(item)
+    if count_before is None:
+        return _err(
+            "Cannot read the item's Fusion comp count, so a new comp could not be "
+            "verified; no comp was added.",
+            code="ADD_COMP_BASELINE_UNREADABLE",
+            category="resolve_api_failed",
+            retryable=True,
+            reason="GetFusionCompCount() failed or returned a non-numeric value before the mutation.",
+            remediation=(
+                "AddFusionComp was NOT called, so nothing changed — it is safe to "
+                "retry once the item is readable."
+            ),
+        )
+
+    names_before = _fusion_comp_name_list(item)
+
+    native_exception: Optional[str] = None
+    raw = None
+    try:
+        raw = item.AddFusionComp()
+    except Exception as exc:
+        native_exception = f"{type(exc).__name__}: {exc}"
+        logger.debug("AddFusionComp raised: %s", native_exception)
+
+    # `is not None` rather than bool(): it cannot itself raise, and it captures
+    # the distinction actually measured (None vs. object). A non-None object
+    # that evaluates falsy would show up here as True, which is the informative
+    # reading of that case.
+    native_returned_object = raw is not None
+
+    count_after = _fusion_comp_count_or_none(item)
+
+    state: Dict[str, Any] = {
+        "comp_count_before": count_before,
+        "comp_count_after": count_after,
+        "native_returned_object": native_returned_object,
+    }
+    if native_exception:
+        state["native_exception"] = native_exception
+
+    if count_after is None:
+        return _err(
+            "AddFusionComp was called but the resulting comp count could not be "
+            "read, so it is unknown whether a comp was created.",
+            code="ADD_COMP_STATE_UNVERIFIABLE",
+            category="resolve_api_failed",
+            retryable=False,
+            reason="GetFusionCompCount() failed or returned a non-numeric value after the mutation.",
+            remediation=_ADD_COMP_INSPECT_FIRST,
+            state=state,
+        )
+
+    delta = count_after - count_before
+    state["delta"] = delta
+
+    if delta == 1:
+        result = _ok(
+            comp_count_before=count_before,
+            comp_count_after=count_after,
+            delta=delta,
+            native_returned_object=native_returned_object,
+            created_comp_name=_fusion_identify_created_comp(
+                names_before, _fusion_comp_name_list(item),
+            ),
+        )
+        if native_exception:
+            result["native_exception"] = native_exception
+        return result
+
+    if delta == 0:
+        if native_returned_object:
+            return _err(
+                "AddFusionComp returned a composition object but the item's comp "
+                "count did not change; the two disagree and the real state is unclear.",
+                code="ADD_COMP_UNVERIFIED",
+                category="resolve_api_failed",
+                retryable=False,
+                reason="Inconsistent signals: an object was returned while the count stayed the same.",
+                remediation=_ADD_COMP_INSPECT_FIRST,
+                state=state,
+            )
+        return _err(
+            "No Fusion comp was added: the item's comp count did not change.",
+            code="ADD_COMP_FAILED",
+            category="resolve_api_failed",
+            retryable=False,
+            reason=(
+                "AddFusionComp raised an exception and the count is unchanged."
+                if native_exception
+                else "AddFusionComp returned nothing and the count is unchanged."
+            ),
+            remediation=_ADD_COMP_INSPECT_FIRST,
+            state=state,
+        )
+
+    return _err(
+        f"The item's Fusion comp count changed by {delta} instead of 1 "
+        f"({count_before} -> {count_after}); the resulting state is not what a "
+        "single add_comp should produce.",
+        code="ADD_COMP_UNEXPECTED_DELTA",
+        category="resolve_api_failed",
+        retryable=False,
+        reason=(
+            "More than one comp appeared." if delta > 1
+            else "Comps disappeared during the call."
+        ),
+        remediation=(
+            _ADD_COMP_INSPECT_FIRST
+            + " Nothing was deleted automatically: resolving an unexpected comp "
+            "count is left to you, since guessing which comp to remove would be "
+            "destructive."
+        ),
+        state=state,
+    )
 
 
 def _resolve_fusion_comp(p: Dict[str, Any], require_timeline_scope: bool = False):
@@ -22880,7 +23090,14 @@ def timeline_item_fusion(action: str, params: Optional[Dict[str, Any]] = None) -
     """Fusion composition operations on timeline items. Identify by track_type, track_index, item_index (item_index is 0-BASED: 0 = first clip; track_index is 1-based).
 
     Actions:
-      add_comp(...) -> {success}
+      add_comp(...) -> {success, comp_count_before, comp_count_after, delta,
+                        native_returned_object, created_comp_name}
+        Success is decided by the item's real comp count (+1), NOT by what
+        AddFusionComp returns: on a generator item Resolve returns None while
+        creating the comp anyway. `created_comp_name` is best-effort and may be
+        null (comp names are not unique). A non-success result is never
+        retryable once the call has been made — read get_comp_count first,
+        since a blind retry appends a second comp.
       get_comp_count(...) -> {count}
       get_comp_names(...) -> {names}
       get_comp_by_name(name, ...) -> {available}
@@ -22901,8 +23118,7 @@ def timeline_item_fusion(action: str, params: Optional[Dict[str, Any]] = None) -
         return err
 
     if action == "add_comp":
-        comp = item.AddFusionComp()
-        return _ok() if comp else _err("Failed to add Fusion comp")
+        return _add_fusion_comp_verified(item)
     elif action == "get_comp_count":
         return {"count": item.GetFusionCompCount()}
     elif action == "get_comp_names":
