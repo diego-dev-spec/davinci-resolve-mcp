@@ -2,17 +2,17 @@
 
 [English](README.md) | 简体中文
 
-[![Version](https://img.shields.io/badge/version-2.86.2-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
+[![Version](https://img.shields.io/badge/version-2.93.0-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
 [![npm](https://img.shields.io/npm/v/davinci-resolve-mcp.svg?label=npm&color=CB3837)](https://www.npmjs.com/package/davinci-resolve-mcp)
 [![API Coverage](https://img.shields.io/badge/API%20Coverage-100%25-brightgreen.svg)](docs/reference/api-coverage.md)
-[![Tools](https://img.shields.io/badge/MCP%20Tools-34%20(341%20full)-blue.svg)](#服务器模式)
+[![Tools](https://img.shields.io/badge/MCP%20Tools-34%20(353%20full)-blue.svg)](#服务器模式)
 [![Advanced](https://img.shields.io/badge/Advanced%20(offline)-18%20tools-blueviolet.svg)](#服务器模式)
-[![Tested](https://img.shields.io/badge/Live%20Tested-96.8%25-green.svg)](docs/reference/api-coverage.md#test-results)
+[![Tested](https://img.shields.io/badge/Live%20Tested-93.6%25-green.svg)](docs/reference/api-coverage.md#test-results)
 [![DaVinci Resolve](https://img.shields.io/badge/DaVinci%20Resolve-18.5+-darkred.svg)](https://www.blackmagicdesign.com/products/davinciresolve)
 [![Python](https://img.shields.io/badge/python-3.10+-green.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-> 本翻译对应 v2.86.2 版 README。如与英文原版有出入，以 [英文原版](README.md) 为准。
+> 本翻译对应 v2.93.0 版 README。如与英文原版有出入，以 [英文原版](README.md) 为准。
 
 一个 Model Context Protocol (MCP) 服务器，让 AI 助手通过官方脚本 API 控制 DaVinci Resolve Studio（达芬奇）。它提供完整的 API 覆盖，外加带护栏的工作流助手，涵盖剪辑、媒体池整理、渲染设置、审阅标记、调色、Fusion、Fairlight、项目生命周期任务、扩展开发，以及不碰源媒体的媒体分析。
 
@@ -53,9 +53,15 @@ python scripts/install_resolve_bridge.py
 `DAVINCI_RESOLVE_BRIDGE=1` 则是*强制*走桥接：它会成为唯一尝试的传输方式，因此桥接一旦停止响应会
 直接报错，而不会悄悄回退到其他传输。当你明确要依赖桥接时使用它。
 
-在 **macOS** 上，这需要 **framework 版 Python**（python.org 官网安装包）。Resolve 只有找到 framework Python 才会枚举 `.py` 脚本——Homebrew、pyenv、conda 的解释器都不被识别，脚本会静默地不出现在菜单里。安装时会顺带装一个 Lua 金丝雀脚本，帮你区分"Python 不对"和"目录放错"。
+在 **macOS** 上，Resolve 只在两个位置查找 Python 3：环境变量 `PYTHON3HOME`，然后是 `/usr/local/bin/python3`。Homebrew、pyenv、uv、conda 都不装在这两处，因此脚本会静默地不出现在菜单里。python.org 安装包之所以有效，是因为它的安装程序会创建 `/usr/local/bin/python3`——但你并不需要它：直接把 Resolve 指向你已有的解释器即可，无需 `sudo`。
 
-已在免费版 21.0.3.7 和 Studio 19.1.3.7 上验证（均为 macOS）。v2.70.1（issue #106）加入的 Windows 路径发布时未经验证；后续免费版 21.0.1.11（issue #109）和免费版 21.0.3.7（issue #112）的用户报告证实，Windows 11 上桥接在 `%PROGRAMDATA%` 和 `%APPDATA%` **两处**都能安装、列出并正常服务，这些路径现在是已证实而非假设。Linux 同样已获证实：免费版 20.3.2.9 的用户报告（issue #129，Fedora 43）显示桥接可安装到 `~/.local/share/DaVinciResolve/Fusion/Scripts/Utility`，用系统 Python 就能直接枚举脚本（Linux 不需要 framework 版 Python），并能端到端正常服务。现在没有任何平台停留在假设上：macOS 为本项目直接验证，Windows 和 Linux 来自用户报告。
+```bash
+launchctl setenv PYTHON3HOME "$(python3 -c 'import sys; print(sys.prefix)')"
+```
+
+必须用 `launchctl setenv` 而不是 `export`——Resolve 从 Dock 启动，看不到你 shell 的环境变量。之后重启 Resolve。安装时会顺带装一个 Lua 金丝雀脚本，帮你区分"Python 未被检测到"和"目录放错"。
+
+已在免费版 21.0.3.7 和 Studio 19.1.3.7 上验证（均为 macOS）。v2.70.1（issue #106）加入的 Windows 路径发布时未经验证；后续免费版 21.0.1.11（issue #109）和免费版 21.0.3.7（issue #112）的用户报告证实，Windows 11 上桥接在 `%PROGRAMDATA%` 和 `%APPDATA%` **两处**都能安装、列出并正常服务，这些路径现在是已证实而非假设。Linux 同样已获证实：免费版 20.3.2.9 的用户报告（issue #129，Fedora 43）显示桥接可安装到 `~/.local/share/DaVinciResolve/Fusion/Scripts/Utility`，用系统 Python 就能直接枚举脚本（Linux 完全没有这套查找问题），并能端到端正常服务。现在没有任何平台停留在假设上：macOS 为本项目直接验证，Windows 和 Linux 来自用户报告。
 
 注意：桥接在服务期间会一直占用端口。v2.70.3 之前，Windows 上的桥接可能在 Resolve 退出后存活，挡住下一个会话的监听器；如果你用的是旧版本且桥接不响应了，检查是否有残留的 `fuscript.exe` 还占着端口。
 
@@ -76,7 +82,7 @@ venv/bin/python -m src.control_panel
 | 模式 | 入口 | 工具数 | 适合谁 |
 |------|------|--------|--------|
 | Compound（复合） | `src/server.py` | 34 | 大多数助手的默认模式。相关的 Resolve 操作按 action 参数分组，压低上下文占用。 |
-| Full / granular（细粒度） | `src/server.py --full` 或 `src/resolve_mcp_server.py` | 341 | 想要"一个 Resolve API 方法 = 一个 MCP 工具"的重度用户。 |
+| Full / granular（细粒度） | `src/server.py --full` 或 `src/resolve_mcp_server.py` | 353 | 想要"一个 Resolve API 方法 = 一个 MCP 工具"的重度用户。 |
 
 除非你明确需要一方法一工具的细粒度界面，否则推荐复合模式。
 
@@ -190,13 +196,13 @@ DRX 调色写入**针对 Resolve Studio 做过实机校准**：调色参数默�
 
 | 指标 | 数值 |
 |------|------|
-| MCP 工具 | **34** 复合 / **341** 细粒度（实时服务器） |
+| MCP 工具 | **34** 复合 / **353** 细粒度（实时服务器） |
 | Advanced（离线）工具 | **18**——.drp/.drt/.drx + 数据库创作，无需 Resolve 运行 |
 | 内核 action | 9 个复合工具下 **136** 个带护栏的工作流 action |
-| API 方法覆盖 | **349/349**（100%） |
-| 实机测试方法数 | **338/349**（96.8%） |
+| API 方法覆盖 | **361/361**（100%） |
+| 实机测试方法数 | **338/361**（93.6%） |
 | 实机测试通过率 | **338/338**（100%） |
-| 测试环境 | DaVinci Resolve 19.1.3 Studio + 20.3.2 Studio + 21.0.2 Studio |
+| 测试环境 | DaVinci Resolve 19.1.3 Studio + 20.3.2 Studio + 21.0.2 Studio + 21.0.3 **免费版**（经内置桥接） |
 
 逐方法状态见 [API 覆盖与测试结果](docs/reference/api-coverage.md)。当前工作流支持见 [内核 action 覆盖](docs/kernels/README.md)。
 

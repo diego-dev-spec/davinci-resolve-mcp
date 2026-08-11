@@ -40,6 +40,12 @@ Render an mp4 only to preview the cut, and say that is what it is.
 
    > Project Settings (gear, bottom-right) → Master Settings → Playback frame rate
 
+   Quote that path as written and **do not extend it from memory** — if the user
+   cannot find it on their build, say you cannot see their screen and point at
+   Blackmagic's manual rather than guessing a second location. Improvised UI
+   directions are what issue #132 cost a user; see the retime entry in
+   `resolve-edit` for the rule.
+
    Do not defer this to the end or write it off as cosmetic; a mismatch has been
    reported to affect playback and output, not just the display. On an existing
    project, read both back and only raise it if they are wrong.
@@ -97,6 +103,7 @@ whose build is older than yours, and update the stamp when you do.
 |---|---|---|---|
 | `clip_infos` `end_frame` is **exclusive** | Studio 21.0 | 1-frame gap between every clip, and matching audio gaps | `end_frame = start_frame + duration` |
 | **Mixed-fps duration floor** — `start_frame`/`end_frame` are **SOURCE** frames | Studio 21.0 (MCP v2.71.1) | Source fps ≠ timeline fps (24.0 or 29.97 source in a 23.976 timeline) → Resolve **floors** the source→timeline conversion, so a range planned to fill an exact record slot lands one frame short | Plan durations in **timeline** frames: `floor(src_frames * timeline_fps / source_fps)`. If the floored duration misses the slot, extend `end_frame` by one source frame and re-check |
+| An **audio** item's source frames are in the **media's** rate, and a WAV freezes the **project's** rate at import | Studio 21.0.3.7 (2026-08-09), corrected on 19.1.3.7 (2026-08-10) | `probe_timeline_structure` returned `source_start: 56871` for a WAV on a 29.97 fps timeline; read at 29.97 that is 1897.6 s, but the clip counts at 24, making it 2369.6 s — out by 7m52s. **24 is not a WAV constant**: a WAV takes the project's `timelineFrameRate` at import and keeps it, so it reads 24 only if the project was at 24 when you imported, and a WAV imported at 29.97 has no mismatch at all | Read the `source_fps` the probe reports beside every item and divide by that — never the timeline rate, and never a hard-coded 24. Video items are fine; they carry their own rate. Feed the media-rate frames back to `create_variant_from_ranges` unchanged; it converts on placement and reports it in `duration_delta`. Related: on an audio item `GetLeftOffset` counts in **timeline** frames while `GetSourceStartFrame` counts in source frames, so the probe reports `source_fps: null` when it had to fall back |
 | `create_timeline_from_clips` needs the current folder | Studio 21.0 | Bare `Failed to create timeline from clip_infos`, valid clip_ids | `media_pool set_current_folder` to the clips' bin first |
 | `ImportMedia` has no destination parameter | Studio 21.0 (MCP v2.71.1) | Clips land wherever the current folder happens to be; an unrecognized destination arg is silently ignored | `set_current_folder` **before** importing (step 4) |
 | Phone footage carries a `rotation` flag | Studio 21.0 | Stored 3840x2160, displays 2160x3840 | Check `rotation` in ffprobe; Resolve honours it. **Do not reframe** — it is already vertical |
@@ -104,10 +111,11 @@ whose build is older than yours, and update the stamp when you do.
 | `timelinePlaybackFrameRate` is read-only | Studio 21.0.2 | `set_setting` returns False for every value form, before and after a timeline exists | No API path. Ask the user to set it in Master Settings during setup (step 3), not at handover |
 | An API-built Fusion comp on a **media clip** renders **only when MediaOut has a path from MediaIn** | Studio 19.1.3.7, corrected 2026-08-02 | A comp wired `MediaIn → Blur → MediaOut` **does** render. But a `MediaOut` fed by a tool with **no source** does not merely get bypassed — the render job comes back `Failed`. The earlier blanket claim that such comps "never render" was too broad | Wire the graph so `MediaOut` descends from `MediaIn`, and never leave a tool unrooted. For text over picture, insert a Fusion **title** as its own timeline clip and set its `Text+` via `fusion_comp set_text_plus` |
 
-The mixed-fps, `ImportMedia`, playback-frame-rate and Fusion rows are recorded in
-the `api_truth` ledger and `docs/reference/api-limitations.md`; query them at
-runtime with `resolve_control api_truth "fusion"` (or `"timeline"`,
-`"media-pool"`). **The ledger is the canonical copy — this table is the
+The mixed-fps, audio-source-rate, `ImportMedia`, playback-frame-rate and Fusion
+rows are recorded in the `api_truth` ledger and
+`docs/reference/api-limitations.md`; query them at runtime with
+`resolve_control api_truth "fusion"` (or `"timeline"`, `"media-pool"`,
+`"frame-rate"`). **The ledger is the canonical copy — this table is the
 narrative version**, so when the two disagree the ledger wins and this table is
 the thing to correct.
 

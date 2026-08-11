@@ -8,10 +8,10 @@ Each tool groups related operations via an 'action' parameter.
 
 Usage:
     python src/server.py              # Start the MCP server
-    python src/server.py --full       # Start the 341-tool granular server instead
+    python src/server.py --full       # Start the 353-tool granular server instead
 """
 
-VERSION = "2.86.2"
+VERSION = "2.93.0"
 
 import base64
 import copy
@@ -49,6 +49,7 @@ from src.utils.mcp_stdio import run_fastmcp_stdio
 from src.utils.api_truth import lookup_api_truth, VERIFIED_ON as _API_TRUTH_VERIFIED_ON
 from src.utils import clip_colors as _clip_colors
 from src.utils import resolve_versions as _resolve_versions
+from src.utils.resolve_probe import api_constant as _api_constant, has_method as _probe_has_method
 from src.utils.contracts import validate as _validate_params
 from src.utils.cut_ir import build_cut_list as _build_cut_list
 from src.utils.page_lock import (
@@ -980,8 +981,10 @@ def _not_connected_error():
             reason="DAVINCI_RESOLVE_BRIDGE is set, so no other transport is tried.",
             remediation="In Resolve, run Workspace > Scripts > resolve_bridge. If it is not in "
                         "that menu, run `python scripts/install_resolve_bridge.py` and restart "
-                        "Resolve; a framework Python from python.org is required for Resolve to "
-                        "list .py scripts at all.",
+                        "Resolve. On macOS, Resolve lists .py scripts only if it can find a "
+                        "Python 3 via PYTHON3HOME or /usr/local/bin/python3; if neither exists, "
+                        "run `launchctl setenv PYTHON3HOME \"$(python3 -c 'import sys; "
+                        "print(sys.prefix)')\"` (launchctl, not export) and restart Resolve.",
             state={"resolve_running": running, "bridge_enabled": True},
         )
     if running:
@@ -1033,7 +1036,7 @@ def _destructive_versioning_provider() -> Optional[Tuple[Any, Any, str, Optional
         except Exception:
             project_name = None
         try:
-            project_id = proj.GetUniqueId() if hasattr(proj, "GetUniqueId") else None
+            project_id = proj.GetUniqueId() if _has_method(proj, "GetUniqueId") else None
         except Exception:
             project_id = None
         root = resolve_media_analysis_output_root(
@@ -1786,7 +1789,8 @@ def _send_resolve_keystroke_go_to_mark_in() -> Dict[str, Any]:
         return {"sent": False, "error": f"{type(exc).__name__}: {exc}"}
 
 def _has_method(obj, method_name):
-    return callable(getattr(obj, method_name, None))
+    # `hasattr` is a constant True on Resolve objects — see src/utils/resolve_probe.
+    return _probe_has_method(obj, method_name)
 
 def _requires_method(obj, method_name, min_version):
     if _has_method(obj, method_name):
@@ -2991,18 +2995,31 @@ def _safe_media_pool_item_name(mpi):
     return None
 
 
-def _timeline_item_source_start(item):
+def _timeline_item_source_start_with_origin(item):
+    """(source_start, origin) — which reader the frame number came from.
+
+    The origin matters because the two readers do not agree on units. On an
+    AUDIO item, measured on Studio 21.0.3.7 across 12 items of one WAV,
+    GetSourceStartFrame advances at exactly 24.000 fps against the item's own
+    GetSourceStartTime (the media's rate) while GetLeftOffset advances at 29.970
+    — the TIMELINE rate. Same edit point, different frame spaces. Callers that
+    attach a rate to the number must know which reader produced it.
+    """
     if _has_method(item, "GetSourceStartFrame"):
         try:
             source_start = _frame_int(item.GetSourceStartFrame())
             if source_start is not None:
-                return source_start
+                return source_start, "GetSourceStartFrame"
         except Exception:
             pass
     try:
-        return _frame_int(item.GetLeftOffset())
+        return _frame_int(item.GetLeftOffset()), "GetLeftOffset"
     except Exception:
-        return None
+        return None, None
+
+
+def _timeline_item_source_start(item):
+    return _timeline_item_source_start_with_origin(item)[0]
 
 
 def _timeline_item_media_pool_item(item):
@@ -3038,7 +3055,149 @@ def _timeline_item_track_info(item):
         return None, _err("invalid source track index")
 
 
-def _timeline_item_summary(item, track_info=None):
+def _media_item_source_fps(media_pool_item, clip_properties=None):
+    """The frame rate a media-pool item's SOURCE frames are counted in.
+
+    Source frames (GetSourceStartFrame / GetLeftOffset) are expressed in the
+    MEDIA's own rate, never the timeline's. A WAV has no intrinsic rate, so it
+    takes the PROJECT's timelineFrameRate at IMPORT and freezes it — measured on
+    Studio 19.1.3.7: imported at 24 it reads 24.0, imported at 29.97 it reads
+    29.97, and moving the project afterwards does not change it. So the rate is
+    read here every time and never assumed; 24 in particular is not a WAV
+    constant, only the value a project that was at 24 handed its imports. Reading
+    a mismatched offset at the timeline rate lands minutes from the real position
+    in the file and nothing errors (see the api_truth entry
+    "GetSourceStartFrame on an AUDIO item"). Returns None when the rate cannot be
+    read, so callers surface "unknown" rather than a guess.
+
+    Pass ``clip_properties`` when the caller already holds the item's property
+    dict — the probe path does, so this costs it no extra bridge call.
+    """
+    value = None
+    if isinstance(clip_properties, dict):
+        value = clip_properties.get("FPS")
+    if value in (None, "") and media_pool_item is not None:
+        try:
+            value = media_pool_item.GetClipProperty("FPS")
+        except Exception:
+            value = None
+        if isinstance(value, dict):  # GetClipProperty("") returns the whole map
+            value = value.get("FPS")
+    try:
+        fps = float(value)
+    except (TypeError, ValueError):
+        return None
+    return fps if fps > 0 else None
+
+
+def _source_frames_to_seconds(frames, fps):
+    """Source frames -> seconds into the file, or None when either is unknown."""
+    if frames is None or not fps:
+        return None
+    return round(frames / fps, 3)
+
+
+def _timeline_item_source_time(item, method):
+    """Resolve's own source-time reader (GetSourceStartTime/GetSourceEndTime).
+
+    Seconds into the source file, read directly — no rate inference, so it is
+    the authoritative answer whenever the build exposes it. None when the
+    method is absent or unreadable, leaving the caller to fall back to
+    frames / source_fps.
+    """
+    if not _has_method(item, method):
+        return None
+    try:
+        value = getattr(item, method)()
+    except Exception:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(seconds, 3)
+
+
+def _timeline_item_source_end_frame(item):
+    """`GetSourceEndFrame` raw — WARNING: its end convention is not fixed.
+
+    Measured on Studio 19.1.3.7 (2026-08-10, 12 items, both regimes): this reader
+    is **exclusive** when the source rate equals the timeline rate, and
+    **inclusive** when they differ — off by one in exactly the case a caller
+    reaches for it. It is not a media-type split; a WAV imported at 29.97 into a
+    29.97 timeline reads exclusive like video, and only the rate MISMATCH flips
+    it. Prefer `_timeline_item_source_end_exclusive`, which sidesteps the
+    convention entirely. Kept raw for the seconds fallback, where a one-frame
+    difference is below the reported precision.
+    """
+    if not _has_method(item, "GetSourceEndFrame"):
+        return None
+    try:
+        return _frame_int(item.GetSourceEndFrame())
+    except Exception:
+        return None
+
+
+def _timeline_item_source_end_exclusive(item, source_start, duration, source_fps):
+    """The EXCLUSIVE source-space end frame — the contract every caller assumes.
+
+    `source_end` has always been exclusive (`src_end_excl` at the append site,
+    `source_end - 1` wherever an inclusive end is wanted). What was wrong was the
+    arithmetic: `source_start + duration` adds a TIMELINE duration to a SOURCE
+    frame, so it is unit-mixed the moment the two rates differ. Measured on
+    Studio 19.1.3.7 against the endFrame actually sent, it overshot by +24, +26,
+    +108 and +149 frames on a 24 fps WAV in a 29.97 timeline, while being exact
+    on every matched-rate item.
+
+    Resolve's own second-reader settles it without knowing the timeline rate:
+    seconds carry no frame-rate assumption, so `GetSourceEndTime x source_fps` is
+    in source space by construction. Measured exact on **12 of 12** valid items
+    across both regimes and both media types — 30.633 s x 24 = 735.19 -> 735,
+    24.524 s x 29.97 = 734.98 -> 735 — and it reproduces the derived value
+    wherever the derived value was already right, so nothing moves for
+    matched-rate media.
+
+    Deliberately NOT `GetSourceEndFrame`: that reader changes convention between
+    the two regimes (see above), so building on it would mean branching on a
+    rate comparison this function would first have to reconstruct.
+
+    Falls back to the historical `source_start + duration` when the second-reader
+    or the rate is unreadable — same value as before, so an older build loses the
+    correction rather than the field.
+    """
+    end_seconds = _timeline_item_source_time(item, "GetSourceEndTime")
+    if end_seconds is not None and source_fps:
+        end_frame = int(round(end_seconds * source_fps))
+        # A source end at or before the start means the readers disagree about
+        # this item; the derived value is the safer answer than a negative span.
+        if source_start is None or end_frame > source_start:
+            return end_frame
+    if source_start is not None and duration is not None:
+        return source_start + duration
+    return None
+
+
+def _timeline_item_source_seconds(item, source_start, source_end, source_fps):
+    """(start_seconds, end_seconds) into the source file, or None each.
+
+    Prefers Resolve's second-readers, then a source-space frame divided by the
+    media rate. The derived ``source_end`` is deliberately NOT a fallback: it
+    is ``source_start + timeline_duration``, so on a 24 fps WAV in a 29.97 fps
+    timeline it overstates the clip's span by 25% (18.1 s reported for a
+    14.5 s clip). An unknown end reads as unknown.
+    """
+    start_seconds = _timeline_item_source_time(item, "GetSourceStartTime")
+    if start_seconds is None:
+        start_seconds = _source_frames_to_seconds(source_start, source_fps)
+    end_seconds = _timeline_item_source_time(item, "GetSourceEndTime")
+    if end_seconds is None:
+        end_seconds = _source_frames_to_seconds(
+            _timeline_item_source_end_frame(item), source_fps)
+    return start_seconds, end_seconds
+
+
+def _timeline_item_summary(item, track_info=None, *, media_pool_item=None,
+                           clip_properties=None):
     if not item:
         return None
     start = end = duration = source_start = source_end = None
@@ -3048,12 +3207,29 @@ def _timeline_item_summary(item, track_info=None):
     except Exception:
         pass
     duration = _timeline_item_duration(item, start, end)
-    source_start = _timeline_item_source_start(item)
-    if source_start is not None and duration is not None:
-        source_end = source_start + duration
+    source_start, source_start_origin = _timeline_item_source_start_with_origin(item)
     if track_info is None:
         track_info, _ = _timeline_item_track_info(item)
-    media_pool_item = _timeline_item_media_pool_item(item)
+    if media_pool_item is None:
+        media_pool_item = _timeline_item_media_pool_item(item)
+    # source_* are in the MEDIA's frame rate; report it and the seconds beside
+    # them so a caller never has to guess which rate the frame numbers are in.
+    media_fps = _media_item_source_fps(media_pool_item, clip_properties)
+    # EXCLUSIVE, as it has always been — but computed in source space now, not
+    # by adding a timeline duration to a source frame. media_fps rather than
+    # source_fps below: the end comes from GetSourceEndTime, which is independent
+    # of whichever reader produced source_start, so the audio caveat that blanks
+    # source_fps must not blank the end as well.
+    source_end = _timeline_item_source_end_exclusive(
+        item, source_start, duration, media_fps)
+    source_fps = media_fps
+    if source_start_origin == "GetLeftOffset" and (track_info or (None,))[0] == "audio":
+        # GetLeftOffset counts an audio item in TIMELINE frames, so pairing it
+        # with the media rate would produce a confidently wrong number. Report
+        # the frame and leave the rate unknown rather than convert it wrong.
+        source_fps = None
+    source_start_seconds, source_end_seconds = _timeline_item_source_seconds(
+        item, source_start, source_end, source_fps)
     summary = {
         "timeline_item_id": _safe_timeline_item_id(item),
         "name": _safe_timeline_item_name(item),
@@ -3063,7 +3239,13 @@ def _timeline_item_summary(item, track_info=None):
         "end": end,
         "duration": duration,
         "source_start": source_start,
+        # EXCLUSIVE source frame. Read from source space via GetSourceEndTime;
+        # falls back to source_start + TIMELINE duration only when that reader or
+        # the media rate is unavailable, which is the old unit-mixed value.
         "source_end": source_end,
+        "source_fps": source_fps,
+        "source_start_seconds": source_start_seconds,
+        "source_end_seconds": source_end_seconds,
         "media_pool_item_id": _safe_media_pool_item_id(media_pool_item),
         "media_pool_item_name": _safe_media_pool_item_name(media_pool_item),
     }
@@ -5007,8 +5189,9 @@ def _conform_capabilities():
 
 
 def _timeline_item_conform_summary(item, track_type: str, track_index: int, item_index: int):
-    summary = _timeline_item_summary(item, (track_type, track_index)) or {}
-    summary["item_index"] = item_index
+    # Fetch the media-pool item and its properties FIRST, then hand both to the
+    # summary: it needs the 'FPS' property for source_fps, and this way the probe
+    # pays for one GetMediaPoolItem/GetClipProperty pair per item, not two.
     media_pool_item = _timeline_item_media_pool_item(item)
     file_path = None
     clip_properties = None
@@ -5018,12 +5201,17 @@ def _timeline_item_conform_summary(item, track_type: str, track_index: int, item
             clip_properties = _ser(media_pool_item.GetClipProperty(""))
         except Exception:
             clip_properties = None
-        if isinstance(clip_properties, dict):
-            file_path = clip_properties.get("File Path") or clip_properties.get("FilePath")
-            for key in ("Status", "Media Status", "Offline", "Online Status"):
-                if key in clip_properties:
-                    media_status = clip_properties.get(key)
-                    break
+    summary = _timeline_item_summary(
+        item, (track_type, track_index),
+        media_pool_item=media_pool_item, clip_properties=clip_properties,
+    ) or {}
+    summary["item_index"] = item_index
+    if isinstance(clip_properties, dict):
+        file_path = clip_properties.get("File Path") or clip_properties.get("FilePath")
+        for key in ("Status", "Media Status", "Offline", "Online Status"):
+            if key in clip_properties:
+                media_status = clip_properties.get(key)
+                break
     summary["file_path"] = file_path
     summary["file_exists"] = bool(file_path and os.path.exists(str(file_path)))
     summary["media_status"] = media_status
@@ -5408,7 +5596,8 @@ def _timeline_apply_look_to_items(tl, p: Dict[str, Any]) -> Dict[str, Any]:
 def _variant_item_placement(item) -> Dict[str, Any]:
     """Report an appended item's placed frame positions in both frame spaces.
     record_* are TIMELINE frames (GetStart/GetEnd/GetDuration); source_start is
-    a SOURCE frame."""
+    a SOURCE frame, counted in source_fps — the MEDIA's rate, which for a WAV is
+    24 and not the timeline's."""
     def _read(method):
         fn = getattr(item, method, None)
         if not callable(fn):
@@ -5422,11 +5611,16 @@ def _variant_item_placement(item) -> Dict[str, Any]:
     duration = _read("GetDuration")
     if duration is None and record_start is not None and record_end is not None:
         duration = record_end - record_start
+    source_start = _timeline_item_source_start(item)
+    source_fps = _media_item_source_fps(_timeline_item_media_pool_item(item))
+    source_start_seconds, _ = _timeline_item_source_seconds(item, source_start, None, source_fps)
     return {
         "record_start": record_start,
         "record_end": record_end,
         "duration": duration,
-        "source_start": _timeline_item_source_start(item),
+        "source_start": source_start,
+        "source_fps": source_fps,
+        "source_start_seconds": source_start_seconds,
     }
 
 
@@ -5902,10 +6096,11 @@ def _timeline_export_value(value, resolve_obj=None):
     if not raw:
         return "", None
     const_name = raw if raw.startswith("EXPORT_") else None
-    if const_name and resolve_obj is not None and hasattr(resolve_obj, const_name):
-        return getattr(resolve_obj, const_name), const_name
     if const_name:
-        return const_name, const_name
+        # hasattr is a constant True on a Resolve object, so the old presence
+        # test always won and handed Export a None from getattr on a build
+        # without the constant. Fall back on the value instead.
+        return _api_constant(resolve_obj, const_name, const_name), const_name
     return raw, None
 
 
@@ -7384,9 +7579,7 @@ def _safe_auto_sync_audio(mp, p: Dict[str, Any]):
 
 
 def _resolve_audio_constant(resolve_obj, name: str, fallback):
-    if resolve_obj is not None and hasattr(resolve_obj, name):
-        return getattr(resolve_obj, name)
-    return fallback
+    return _api_constant(resolve_obj, name, fallback)
 
 
 def _normalize_auto_sync_settings(settings: Dict[str, Any], resolve_obj=None):
@@ -13582,6 +13775,19 @@ def resolve_control(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
       get_fairlight_presets() -> {presets}
       set_high_priority() -> {success}
       disable_background_tasks_for_current_session() -> {success}  — Resolve 21+
+      list_user_preferences_presets() -> {presets}  — Resolve 21.0.4+
+      save_user_preferences_preset(name) -> {success}  — Resolve 21.0.4+
+      load_user_preferences_preset(name) -> {success}  — Resolve 21.0.4+.
+        SESSION-WIDE: swaps the user's global Resolve preferences, not a
+        project setting. Only call when the user asked for the switch.
+      delete_user_preferences_preset(name) -> {success}  — Resolve 21.0.4+
+      import_user_preferences_preset(path, name?) -> {success}  — Resolve 21.0.4+.
+        The imported preset is NOT auto-loaded; follow with
+        load_user_preferences_preset to activate it. Omitting name is safe
+        (reported on 21.0.4.5: single-arg returns True, not a TypeError) and
+        the preset is then named after the file, so pass name when the preset
+        should be called something the filename does not say.
+      export_user_preferences_preset(name, path) -> {success}  — Resolve 21.0.4+
       open_control_panel(port?, host?, open_browser?) -> {success, url, pid, port, status}
         — Launches the analysis control panel (src/analysis_dashboard.py) as a background process.
           Idempotent: returns the existing URL if already running.
@@ -13775,10 +13981,33 @@ def resolve_control(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
     if action == "get_version":
         update_env = _setup_update_env()
         mcp_update = get_cached_update_status(project_dir, VERSION, env=update_env)
+        version_string = r.GetVersionString()
+        # The first call of nearly every session. Issue #132 is the report of an
+        # agent describing a surface that was not on the user's build, and the
+        # reason it could happen is that nothing in the session ever said which
+        # build that was in terms of what is missing from it. So the answer to
+        # "what am I connected to" now carries what this build does not have,
+        # rather than waiting to be asked.
+        missing = _resolve_versions.gates_unavailable_on(version_string)
         return {
             "product": r.GetProductName(),
             "version": r.GetVersion(),
-            "version_string": r.GetVersionString(),
+            "version_string": version_string,
+            "build": {
+                "unavailable_on_this_build": missing,
+                "known_gates": len(_resolve_versions.VERSION_GATES),
+                "note": (
+                    f"{len(missing)} recorded surface(s) are absent on this build. "
+                    "Do not offer them. An absence from this list is NOT a promise "
+                    "the method exists — most of the scripting API has never been "
+                    "version-bisected, so ask check_version_support for a specific "
+                    "symbol and probe when it answers `unknown`."
+                    if missing else
+                    "This build clears every recorded version gate. That is not a "
+                    "promise about surfaces nobody has bisected — ask "
+                    "check_version_support for a specific symbol before offering it."
+                ),
+            },
             "mcp": {
                 "version": VERSION,
                 "update": mcp_update,
@@ -13817,7 +14046,59 @@ def resolve_control(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
             return missing
         r.DisableBackgroundTasksForCurrentResolveSession()
         return _ok()
-    return _unknown(action, ["launch","runtime_mode","get_version","api_truth","check_version_support","verification_stats","job_status","list_jobs","mcp_update_status","set_mcp_update_policy","ignore_mcp_update","snooze_mcp_update","clear_mcp_update_preferences","get_page","open_page","get_keyframe_mode","set_keyframe_mode","quit","get_fairlight_presets","set_high_priority","disable_background_tasks_for_current_session","open_control_panel","control_panel_status","close_control_panel","save_state","restore_state"])
+    elif action == "list_user_preferences_presets":
+        missing = _requires_method(r, "GetUserPreferencesPresetList", "21.0.4")
+        if missing:
+            return missing
+        return {"presets": _ser(r.GetUserPreferencesPresetList() or [])}
+    elif action == "save_user_preferences_preset":
+        missing = _requires_method(r, "SaveUserPreferencesPreset", "21.0.4")
+        if missing:
+            return missing
+        if not p.get("name"):
+            return _err("save_user_preferences_preset requires name")
+        return {"success": bool(r.SaveUserPreferencesPreset(p["name"]))}
+    elif action == "load_user_preferences_preset":
+        missing = _requires_method(r, "LoadUserPreferencesPreset", "21.0.4")
+        if missing:
+            return missing
+        if not p.get("name"):
+            return _err("load_user_preferences_preset requires name")
+        return {"success": bool(r.LoadUserPreferencesPreset(p["name"]))}
+    elif action == "delete_user_preferences_preset":
+        missing = _requires_method(r, "DeleteUserPreferencesPreset", "21.0.4")
+        if missing:
+            return missing
+        if not p.get("name"):
+            return _err("delete_user_preferences_preset requires name")
+        return {"success": bool(r.DeleteUserPreferencesPreset(p["name"]))}
+    elif action == "import_user_preferences_preset":
+        missing = _requires_method(r, "ImportUserPreferencesPreset", "21.0.4")
+        if missing:
+            return missing
+        if not p.get("path"):
+            return _err("import_user_preferences_preset requires path")
+        if p.get("name"):
+            ok = bool(r.ImportUserPreferencesPreset(p["path"], p["name"]))
+        else:
+            ok = bool(r.ImportUserPreferencesPreset(p["path"]))
+        note = "The imported preset is not auto-loaded; use load_user_preferences_preset to activate it."
+        if not p.get("name"):
+            note += (" No name was given, so the preset takes its name from the file — "
+                     "list_user_preferences_presets to read it back.")
+        return {"success": ok, "note": note}
+    elif action == "export_user_preferences_preset":
+        missing = _requires_method(r, "ExportUserPreferencesPreset", "21.0.4")
+        if missing:
+            return missing
+        err, clean = _validate_params(p, {
+            "name": {"type": str, "required": True, "non_empty": True},
+            "path": {"type": str, "required": True, "non_empty": True},
+        })
+        if err:
+            return _err(err)
+        return {"success": bool(r.ExportUserPreferencesPreset(clean["name"], clean["path"]))}
+    return _unknown(action, ["launch","runtime_mode","get_version","api_truth","check_version_support","verification_stats","job_status","list_jobs","mcp_update_status","set_mcp_update_policy","ignore_mcp_update","snooze_mcp_update","clear_mcp_update_preferences","get_page","open_page","get_keyframe_mode","set_keyframe_mode","quit","get_fairlight_presets","set_high_priority","disable_background_tasks_for_current_session","list_user_preferences_presets","save_user_preferences_preset","load_user_preferences_preset","delete_user_preferences_preset","import_user_preferences_preset","export_user_preferences_preset","open_control_panel","control_panel_status","close_control_panel","save_state","restore_state"])
 
 
 # ─── V2 C4: Per-field corrections with provenance + changelog ────────────────
@@ -14683,6 +14964,7 @@ def layout_presets(action: str, params: Optional[Dict[str, Any]] = None) -> Dict
     """Manage DaVinci Resolve UI layout presets.
 
     Actions:
+      list() -> {presets}  — Resolve 21.0.4+; saved layout preset names
       save(name) -> {success}
       load(name) -> {success}
       update(name) -> {success}
@@ -14695,7 +14977,12 @@ def layout_presets(action: str, params: Optional[Dict[str, Any]] = None) -> Dict
     if r is None:
         return _not_connected_error()
 
-    if action == "save":
+    if action == "list":
+        missing = _requires_method(r, "GetLayoutPresetList", "21.0.4")
+        if missing:
+            return missing
+        return {"presets": _ser(r.GetLayoutPresetList() or [])}
+    elif action == "save":
         if not p.get("name"):
             return _err("save requires name")
         return {"success": bool(r.SaveLayoutPreset(p["name"]))}
@@ -14717,7 +15004,7 @@ def layout_presets(action: str, params: Optional[Dict[str, Any]] = None) -> Dict
         return {"success": bool(r.ImportLayoutPreset(p["path"]))}
     elif action == "delete":
         return {"success": bool(r.DeleteLayoutPreset(p["name"]))}
-    return _unknown(action, ["save","load","update","export","import_preset","delete"])
+    return _unknown(action, ["list","save","load","update","export","import_preset","delete"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -14734,6 +15021,10 @@ def render_presets(action: str, params: Optional[Dict[str, Any]] = None) -> Dict
       export_render(name, path) -> {success}
       import_burnin(path) -> {success}
       export_burnin(name, path) -> {success}
+      list_burnin() -> {presets}  — Resolve 21.0.4+; burn-in preset names usable
+        with the render tool's DataBurnIn setting and load_burnin_preset on
+        project_settings / timeline_item
+      delete_burnin(name) -> {success}  — Resolve 21.0.4+
     """
     p = _params(params)
     r = get_resolve()
@@ -14748,7 +15039,19 @@ def render_presets(action: str, params: Optional[Dict[str, Any]] = None) -> Dict
         return {"success": bool(r.ImportBurnInPreset(p["path"]))}
     elif action == "export_burnin":
         return {"success": bool(r.ExportBurnInPreset(p["name"], p["path"]))}
-    return _unknown(action, ["import_render","export_render","import_burnin","export_burnin"])
+    elif action == "list_burnin":
+        missing = _requires_method(r, "GetBurnInPresetList", "21.0.4")
+        if missing:
+            return missing
+        return {"presets": _ser(r.GetBurnInPresetList() or [])}
+    elif action == "delete_burnin":
+        missing = _requires_method(r, "DeleteBurnInPreset", "21.0.4")
+        if missing:
+            return missing
+        if not p.get("name"):
+            return _err("delete_burnin requires name")
+        return {"success": bool(r.DeleteBurnInPreset(p["name"]))}
+    return _unknown(action, ["import_render","export_render","import_burnin","export_burnin","list_burnin","delete_burnin"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -14784,6 +15087,7 @@ _PROJECT_MANAGER_METHODS = [
     "CreateFolder",
     "DeleteFolder",
     "GetProjectListInCurrentFolder",
+    "GetProjectAttributesInCurrentFolder",
     "GetFolderListInCurrentFolder",
     "GotoRootFolder",
     "GotoParentFolder",
@@ -14939,6 +15243,7 @@ def _project_capabilities(pm=None, project=None, resolve_obj=None) -> Dict[str, 
         "kernel_actions": list(_PROJECT_KERNEL_ACTIONS),
         "resolve": {
             "layout_presets": {
+                "list": _has_method(resolve_obj, "GetLayoutPresetList") if resolve_obj else True,
                 "save": _has_method(resolve_obj, "SaveLayoutPreset") if resolve_obj else True,
                 "load": _has_method(resolve_obj, "LoadLayoutPreset") if resolve_obj else True,
                 "update": _has_method(resolve_obj, "UpdateLayoutPreset") if resolve_obj else True,
@@ -14951,6 +15256,16 @@ def _project_capabilities(pm=None, project=None, resolve_obj=None) -> Dict[str, 
                 "export_render": _has_method(resolve_obj, "ExportRenderPreset") if resolve_obj else True,
                 "import_burnin": _has_method(resolve_obj, "ImportBurnInPreset") if resolve_obj else True,
                 "export_burnin": _has_method(resolve_obj, "ExportBurnInPreset") if resolve_obj else True,
+                "list_burnin": _has_method(resolve_obj, "GetBurnInPresetList") if resolve_obj else True,
+                "delete_burnin": _has_method(resolve_obj, "DeleteBurnInPreset") if resolve_obj else True,
+            },
+            "user_preferences_presets": {
+                "list": _has_method(resolve_obj, "GetUserPreferencesPresetList") if resolve_obj else True,
+                "save": _has_method(resolve_obj, "SaveUserPreferencesPreset") if resolve_obj else True,
+                "load": _has_method(resolve_obj, "LoadUserPreferencesPreset") if resolve_obj else True,
+                "delete": _has_method(resolve_obj, "DeleteUserPreferencesPreset") if resolve_obj else True,
+                "import": _has_method(resolve_obj, "ImportUserPreferencesPreset") if resolve_obj else True,
+                "export": _has_method(resolve_obj, "ExportUserPreferencesPreset") if resolve_obj else True,
             },
         },
     }
@@ -15249,6 +15564,7 @@ def _preset_lifecycle_probe(resolve_obj, project, p: Dict[str, Any]) -> Dict[str
         "quick_export_presets": {"available": _has_method(project, "GetQuickExportRenderPresets")},
         "fairlight_presets": {"available": _has_method(resolve_obj, "GetFairlightPresets")},
         "layout_presets": {
+            "list": _has_method(resolve_obj, "GetLayoutPresetList"),
             "save": _has_method(resolve_obj, "SaveLayoutPreset"),
             "load": _has_method(resolve_obj, "LoadLayoutPreset"),
             "update": _has_method(resolve_obj, "UpdateLayoutPreset"),
@@ -15261,6 +15577,16 @@ def _preset_lifecycle_probe(resolve_obj, project, p: Dict[str, Any]) -> Dict[str
             "export_render": _has_method(resolve_obj, "ExportRenderPreset"),
             "import_burnin": _has_method(resolve_obj, "ImportBurnInPreset"),
             "export_burnin": _has_method(resolve_obj, "ExportBurnInPreset"),
+            "list_burnin": _has_method(resolve_obj, "GetBurnInPresetList"),
+            "delete_burnin": _has_method(resolve_obj, "DeleteBurnInPreset"),
+        },
+        "user_preferences_presets": {
+            "list": _has_method(resolve_obj, "GetUserPreferencesPresetList"),
+            "save": _has_method(resolve_obj, "SaveUserPreferencesPreset"),
+            "load": _has_method(resolve_obj, "LoadUserPreferencesPreset"),
+            "delete": _has_method(resolve_obj, "DeleteUserPreferencesPreset"),
+            "import": _has_method(resolve_obj, "ImportUserPreferencesPreset"),
+            "export": _has_method(resolve_obj, "ExportUserPreferencesPreset"),
         },
     }
     try:
@@ -15642,6 +15968,9 @@ def project_manager(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
 
     Actions:
       list() -> {projects}
+      list_attributes() -> {projects: {name: {lastModifiedDate, creationDate, notes, liveCollaborationMode}}}
+        — Resolve 21.0.4+. Per-project attributes for the current folder without
+          loading any project.
       get_current() -> {name, id}
       create(name, media_location_path?) -> {success, name}
       load(name) -> {success}
@@ -15723,6 +16052,11 @@ def project_manager(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
         return _project_boundary_report(r, pm, proj, p)
     elif action == "list":
         return {"projects": pm.GetProjectListInCurrentFolder()}
+    elif action == "list_attributes":
+        missing = _requires_method(pm, "GetProjectAttributesInCurrentFolder", "21.0.4")
+        if missing:
+            return missing
+        return {"projects": _ser(pm.GetProjectAttributesInCurrentFolder() or {})}
     elif action == "get_current":
         proj = pm.GetCurrentProject()
         return {"name": proj.GetName(), "id": proj.GetUniqueId()} if proj else _err("No project open")
@@ -15777,7 +16111,7 @@ def project_manager(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
         if not p.get("path"):
             return _err("restore requires path")
         return {"success": bool(pm.RestoreProject(p["path"], p.get("name")))}
-    return _unknown(action, ["list","get_current","create","load","save","close","delete","import_project","export_project","archive","restore","lint","diff_to_spec","plan_spec","apply_spec", *_PROJECT_KERNEL_ACTIONS])
+    return _unknown(action, ["list","list_attributes","get_current","create","load","save","close","delete","import_project","export_project","archive","restore","lint","diff_to_spec","plan_spec","apply_spec", *_PROJECT_KERNEL_ACTIONS])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -15900,6 +16234,37 @@ def project_manager_database(action: str, params: Optional[Dict[str, Any]] = Non
 # TOOL 8: project_settings
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _setting_limitation(name: Any, obj: str = "Project") -> Optional[Dict[str, Any]]:
+    """The api_truth entry for a settings key on `obj`, when one exists.
+
+    `SetSetting` reports a refusal as a bare `False` with no reason, and for
+    several keys this repo has already measured the reason and written it down —
+    `timelinePlaybackFrameRate` returns False for every value form, before and
+    after a timeline exists (issue #141, PR #99). A caller who gets
+    `{"success": false}` has no way to tell "you passed a bad value" from "this
+    key cannot be written from the API at all", and the second one is a
+    different task: it has to go to the user as a UI step.
+
+    Matched narrowly on purpose. The entry must name this exact key *and* be
+    `obj.SetSetting`, because attaching an unrelated explanation to a failure is
+    worse than attaching none — it reads as a diagnosis. `Project` and
+    `Timeline` both have a `SetSetting` and their keys overlap by name, so the
+    object is part of the match rather than assumed.
+    """
+    if not isinstance(name, str) or not name:
+        return None
+    prefix = f"{obj}.SetSetting"
+    quoted = f"'{name}'"
+    for entry in lookup_api_truth(name):
+        symbol = entry.get("symbol", "")
+        # The quoted form is what makes this an exact key match: `name in
+        # symbol` would hand the timelinePlaybackFrameRate entry to anything
+        # that is a substring of it, "timeline" included.
+        if symbol.startswith(prefix) and quoted in symbol:
+            return entry
+    return None
+
+
 @mcp.tool()
 @_guard_missing_params
 def project_settings(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -15909,7 +16274,9 @@ def project_settings(action: str, params: Optional[Dict[str, Any]] = None) -> Di
       get_name() -> {name}
       set_name(name) -> {success}
       get_setting(name?) -> {settings}  — omit name for all settings
-      set_setting(name, value) -> {success}
+      set_setting(name, value) -> {success, known_limitation?}
+        A refusal carries the api_truth entry for that key when one exists —
+        several settings cannot be written from the API at all.
       get_unique_id() -> {id}
       get_presets() -> {presets}
       set_preset(name) -> {success}
@@ -15945,7 +16312,20 @@ def project_settings(action: str, params: Optional[Dict[str, Any]] = None) -> Di
             return _err("set_setting requires name")
         if "value" not in p:
             return _err("set_setting requires value")
-        return {"success": bool(proj.SetSetting(p["name"], p["value"]))}
+        if bool(proj.SetSetting(p["name"], p["value"])):
+            return {"success": True}
+        known = _setting_limitation(p["name"])
+        if not known:
+            return {"success": False}
+        return {
+            "success": False,
+            "known_limitation": {
+                "symbol": known.get("symbol"),
+                "reality": known.get("reality"),
+                "recommended": known.get("recommended"),
+                "ledger_verified_on": _API_TRUTH_VERIFIED_ON,
+            },
+        }
     elif action == "get_unique_id":
         return {"id": proj.GetUniqueId()}
     elif action == "get_presets":
@@ -21206,7 +21586,12 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
     Frame numbers are TIMELINE/record frames (position on the timeline) unless an action
     says SOURCE. Source frames are positions within a media-pool clip's own media:
     create_variant_from_ranges takes SOURCE start_frame/end_frame; extract_source_frame_ranges
-    and source_range_report return SOURCE ranges.
+    and source_range_report return SOURCE ranges. A SOURCE frame is counted in the MEDIA's own
+    frame rate, not the timeline's: an AUDIO item's source_start/source_end read back in the
+    file's rate. A WAV has no intrinsic rate and freezes the PROJECT's rate at import, so it
+    differs from the timeline whenever the project moved afterwards — read source_fps, never
+    assume 24, and converting at the timeline rate is silently wrong by minutes
+    (resolve_control api_truth "GetSourceStartFrame").
 
     Actions:
       list() -> {timelines}
@@ -21262,6 +21647,8 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         nothing moves. (frames here are TIMELINE/record frames.)
       story_spine_report() -> {beats, track_summaries, source_ranges, audio_spine}
       create_variant_from_ranges(name, ranges, markers?, cdl?, dry_run?) -> {success, id, items}
+        ranges[] take track_type? (video|audio) and track_index? (1-based, within the
+        track_type, default 1); missing tracks are added, so V2/V3 multicam angles survive.
         # example: action_help(name='<action_name>')
       bulk_set_item_properties(ops, dry_run?, readback?) -> {results, op_count}
         # example: action_help(name='<action_name>')
@@ -21285,7 +21672,8 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
       export(path, type, subtype?, background?) -> {success | job_id}  — type: AAF, EDL, FCPXML, etc.
         UNSAFE. No path sandboxing. Prefer export_timeline_checked.
       get_setting(name?) -> {settings}
-      set_setting(name, value) -> {success}
+      set_setting(name, value) -> {success, known_limitation?}
+        A refusal carries the api_truth entry for that key when one exists.
       insert_generator(name) -> {success}
       insert_fusion_generator(name) -> {success}
       insert_fusion_composition() -> {success}
@@ -21323,6 +21711,16 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         Default handles=24, gap_max=30. Use handles=0 for gap-only auto handles.
       conform_capabilities() -> {supported, partially_supported, unsupported, export_aliases}
       probe_timeline_structure(track_types?, include_markers?, include_clip_properties?) -> {tracks, markers}
+        Each item reports source_start/source_end (SOURCE frames, end EXCLUSIVE) in the
+        MEDIA's frame rate, the source_fps they are counted in, and
+        source_start_seconds/source_end_seconds. Use the reported source_fps — a WAV
+        freezes the PROJECT's rate at import, so it differs from the timeline whenever
+        the project moved afterwards, and dividing by the timeline rate is then wrong by
+        minutes. source_fps is null when the rate could not be read; treat the frames as
+        unitless then, do not assume the timeline's. source_end comes from
+        GetSourceEndTime x source_fps, so it is a source frame even when the rates
+        differ; it falls back to source_start + TIMELINE duration (unit-mixed) only when
+        that reader or the rate is unavailable.
       detect_gaps_overlaps(track_types?, min_gap?) -> {gaps, overlaps}
       source_range_report(handles?, merge?) -> {ranges, occurrences}
       export_timeline_checked(path, format?|type?, subtype?, require_temp_path?, dry_run?, background?) -> {success, path, size | job_id}
@@ -21645,7 +22043,20 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
     elif action == "get_setting":
         return {"settings": _ser(tl.GetSetting(p.get("name", "")))}
     elif action == "set_setting":
-        return {"success": bool(tl.SetSetting(p["name"], p["value"]))}
+        if bool(tl.SetSetting(p["name"], p["value"])):
+            return {"success": True}
+        known = _setting_limitation(p["name"], obj="Timeline")
+        if not known:
+            return {"success": False}
+        return {
+            "success": False,
+            "known_limitation": {
+                "symbol": known.get("symbol"),
+                "reality": known.get("reality"),
+                "recommended": known.get("recommended"),
+                "ledger_verified_on": _API_TRUTH_VERIFIED_ON,
+            },
+        }
     elif action == "insert_generator":
         r = tl.InsertGeneratorIntoTimeline(p["name"])
         return _ok() if r else _err("Failed to insert generator")
@@ -22615,9 +23026,7 @@ def _resolve_lut_export_type(export_type, resolve_obj=None):
         const_name = raw
     if not const_name:
         return None, _err(f"Unknown LUT export type: {raw}")
-    if resolve_obj and hasattr(resolve_obj, const_name):
-        return getattr(resolve_obj, const_name), None
-    return const_name, None
+    return _api_constant(resolve_obj, const_name, const_name), None
 
 
 def _validate_cdl_payload(cdl):
@@ -23135,9 +23544,16 @@ _ACTION_HELP: Dict[str, Dict[str, Dict[str, Any]]] = {
             "summary": "Build a variant timeline from N source ranges. Video-only unless ranges include track_type='audio'. Source-safe; dry_run validates clip ids and frame ranges.",
             "params": (
                 "name, ranges: [{clip_id|media_pool_item_id, start_frame, end_frame, "
-                "record_frame?, track_type?}], pack?, markers?, cdl?, dry_run?  — clip_id is a "
+                "record_frame?, track_type?, track_index?}], pack?, markers?, cdl?, dry_run?  — clip_id is a "
                 "media-pool item id (not a timeline-item id); start_frame/end_frame are SOURCE "
                 "frames, end_frame exclusive (source duration = end_frame - start_frame). "
+                "track_index is the 1-based destination track WITHIN track_type (default 1); the "
+                "variant is created with enough video/audio tracks to cover the highest index used, "
+                "so multicam angles can be rebuilt onto V2/V3 instead of collapsing onto V1. "
+                "SOURCE frames are counted in the MEDIA's frame rate, not the timeline's — read the "
+                "clip's source_fps rather than assuming one, since a WAV freezes the PROJECT's rate "
+                "at import (api_truth \"GetSourceStartFrame on an AUDIO item\"); pass the frames in "
+                "that space, placement converts and items[].duration_delta reports the conversion. "
                 "pack=true butts clips together at the end of each track (gap-free, ignores record_frame)"
             ),
             "returns": "{success, id, items}  — items[].placed = placed frames; items[].range = the requested range",
@@ -23145,8 +23561,11 @@ _ACTION_HELP: Dict[str, Dict[str, Dict[str, Any]]] = {
                 'timeline(action="create_variant_from_ranges", params={\n'
                 '  "name": "v02_tighter_act1",\n'
                 '  "ranges": [\n'
-                '    {"clip_id": "<media-pool-item-id>", "start_frame": 1200, "end_frame": 1320},\n'
-                '    {"clip_id": "<media-pool-item-id>", "start_frame": 1500, "end_frame": 1600}\n'
+                '    {"clip_id": "<cam1-id>", "start_frame": 1200, "end_frame": 1320},\n'
+                '    {"clip_id": "<cam3-id>", "start_frame": 1500, "end_frame": 1600,\n'
+                '     "track_index": 2},\n'
+                '    {"clip_id": "<wav-id>", "track_type": "audio", "track_index": 1,\n'
+                '     "start_frame": 56871, "end_frame": 57591}  # frames in the WAV\'s own source_fps\n'
                 '  ],\n'
                 '  "dry_run": True\n'
                 '})'
@@ -28371,7 +28790,7 @@ def _resource_current_project() -> Dict[str, Any]:
     return {
         "open": True,
         "name": proj.GetName(),
-        "id": proj.GetUniqueId() if hasattr(proj, "GetUniqueId") else None,
+        "id": proj.GetUniqueId() if _has_method(proj, "GetUniqueId") else None,
     }
 
 
@@ -28394,7 +28813,7 @@ def _resource_current_timeline() -> Dict[str, Any]:
     return {
         "open": True,
         "name": tl.GetName(),
-        "id": tl.GetUniqueId() if hasattr(tl, "GetUniqueId") else None,
+        "id": tl.GetUniqueId() if _has_method(tl, "GetUniqueId") else None,
         "start_frame": tl.GetStartFrame(),
         "end_frame": tl.GetEndFrame(),
         "start_timecode": tl.GetStartTimecode(),
@@ -28531,9 +28950,9 @@ if __name__ == "__main__":
     start_background_update_check(VERSION, project_dir, logger, env=_setup_update_env())
     _install_threaded_tool_dispatch(mcp)
 
-    # Support --full flag to run the 341-tool granular server instead
+    # Support --full flag to run the 353-tool granular server instead
     if "--full" in sys.argv:
-        logger.info("Starting full 341-tool granular server...")
+        logger.info("Starting full 353-tool granular server...")
         sys.argv = [arg for arg in sys.argv if arg != "--full"]
         from src.granular import mcp as granular_mcp
 

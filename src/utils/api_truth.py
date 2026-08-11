@@ -124,11 +124,18 @@ API_TRUTH: List[Dict[str, Any]] = [
                    "float), both before and after a timeline exists, so the "
                    "playback frame rate cannot be set from the API at all. "
                    "Reported by a community contributor against Resolve Studio "
-                   "while assembling a vertical timeline (PR #99).",
+                   "while assembling a vertical timeline (PR #99), and "
+                   "independently on Resolve 20.2 against a freshly created "
+                   "project whose timeline rate already read 60 (issue #141) — "
+                   "so a matching timelineFrameRate does not unlock the write.",
         "recommended": "Ask the user to set it in Project Settings > Master "
                        "Settings > Playback frame rate as a SETUP step, before "
                        "any timeline exists. Read it back to confirm; do not "
-                       "report it as set on the strength of the call alone.",
+                       "report it as set on the strength of the call alone. The "
+                       "issue #141 reporter's workaround is worth passing on "
+                       "for repeat setups: duplicate a project that already "
+                       "carries the wanted playback rate rather than creating "
+                       "one and trying to write it.",
         "tags": ["project-settings", "silent-failure", "timeline"],
         "submit": "missing",
     },
@@ -654,6 +661,129 @@ API_TRUTH: List[Dict[str, Any]] = [
         "submit": "bug",
     },
     {
+        "symbol": "TimelineItem.GetSourceStartFrame on an AUDIO item (media-rate frames; a WAV freezes the PROJECT rate at import)",
+        "object": "TimelineItem",
+        "signature": "() -> int  # source frame, counted in the MEDIA's frame rate",
+        "reality": "The value is counted in the source MEDIA's own frame rate, not "
+                   "the timeline's. CORRECTION (2026-08-10, Studio 19.1.3.7): an "
+                   "earlier version of this entry said a WAV 'carries no frame rate, "
+                   "so Resolve falls back to 24 fps'. That is WRONG, and 24 is not a "
+                   "constant to rely on. A WAV takes the PROJECT's timelineFrameRate "
+                   "AT IMPORT and freezes it. Measured with one 400.000 s 48 kHz WAV "
+                   "imported into three project states: project at 24 -> clip FPS "
+                   "24.0, Duration 00:06:40:00 (9600 frames = 400 s); project at "
+                   "29.97 -> clip FPS 29.97, Duration 00:06:39:18 (11988 frames = "
+                   "400 s); and changing the project rate to 29.97 AFTER import left "
+                   "the clip reading 24.0 (SetSetting returned True and the project "
+                   "did move). So the mismatch is not 'audio is always 24' but "
+                   "'the clip kept the rate the project had when it was imported, "
+                   "and the project moved afterwards' — which also means a WAV "
+                   "imported into a 29.97 project behaves exactly like video, with "
+                   "no trap at all. ALWAYS read the clip's FPS property; never "
+                   "assume 24. The original 21.0.3.7 report below is consistent with "
+                   "this: that project was at 24 when the WAV was imported. "
+                   "Reading the frames at the timeline rate lands "
+                   "minutes away from the real position in the file. Verified live "
+                   "on Studio 21.0.3.7 (2026-08-09, 29.97 fps timeline): a "
+                   "ZOOM0028.WAV item reported source_start 56871, which is "
+                   "56871 / 24 = 2369.6 s into the file, NOT the 1897.6 s a 29.97 "
+                   "fps reading gives — a 471.9 s (7 min 52 s) error. Nothing looks "
+                   "wrong, because timeline probe_timeline_structure derives "
+                   "source_end as source_start + timeline_duration: the start/end "
+                   "pair stays internally consistent whatever rate you assume. "
+                   "VIDEO items are NOT affected — two 29.97 fps items "
+                   "(KR020007.MOV, IMG_0001.mov) on the same timeline reported "
+                   "source frames in their own, matching rate, confirmed against "
+                   "ffprobe durations and span arithmetic. This is the read-side "
+                   "twin of the AppendToTimeline mixed-fps entry below: that one is "
+                   "about writing source frames whose rate differs from the "
+                   "timeline's, this one about reading them back and not knowing "
+                   "which rate they are in. The rate was pinned by regression, "
+                   "not assumed: across 12 items of the same WAV, "
+                   "GetSourceStartFrame advances at 24.000 fps against the item's "
+                   "own GetSourceStartTime (24.0000/24.0007/23.9995 over spans up "
+                   "to 22 minutes). The same measurement exposed a second unit "
+                   "trap: on an AUDIO item GetLeftOffset advances at 29.970 — the "
+                   "TIMELINE rate — so the two readers describe the same edit "
+                   "point in DIFFERENT frame spaces (60687 vs 75784 for one "
+                   "item). On video they share the source space. Caveat on the "
+                   "absolute zero: Resolve's model of this file is 133003 frames "
+                   "(Duration 01:32:21:19 at 24 fps = 5541.79 s) while its true "
+                   "PCM length is 266264768 samples / 48 kHz = 5547.18 s, a 0.097% "
+                   "difference we have not explained — so frames/24 is exact in "
+                   "Resolve's source-time space, which is the space every other "
+                   "Resolve call uses, but may sit ~2 s off the byte position in "
+                   "a 40-minute-deep offset. Re-confirmed on Studio 19.1.3.7 "
+                   "(2026-08-10) with synthetic media, so this is not a 21.x "
+                   "regression: a 300 s 48 kHz WAV reports FPS 24, and appending "
+                   "source frames 4800-5235 of it to a 29.97 fps timeline yields "
+                   "a timeline duration of 543 (= 435 x 29.97/24), which is the "
+                   "conversion happening in the open. The same run measured the "
+                   "cost of the derived end: source_end came back 5343 "
+                   "(4800 + 543) where the true source end is 5235, so "
+                   "source_end / 24 reports 222.625 s against a real 218.133 s "
+                   "from GetSourceEndTime — 4.49 s out, on a clip only 18.1 s "
+                   "long. GetSourceStartTime read exactly 200.0 s (= 4800/24) on "
+                   "the same item. The matching VIDEO item (29.97 source in a "
+                   "29.97 timeline) was unaffected in both: 24.524 s read against "
+                   "24.525 s derived. Both second-readers exist on 19.1.3.7, so "
+                   "the GetSourceEndFrame fallback below is for builds older "
+                   "still. GetSourceEndFrame ITSELF changes convention between "
+                   "the two regimes and cannot be used raw: measured over 12 "
+                   "items on 19.1.3.7, it is EXCLUSIVE (equals the endFrame "
+                   "sent) when the source rate equals the timeline rate, and "
+                   "INCLUSIVE (one less) when they differ — off by one in "
+                   "exactly the case a caller reaches for it. It is not a "
+                   "media-type split: the same WAV imported at 29.97 into a "
+                   "29.97 timeline read exclusive, like video, and only the "
+                   "rate MISMATCH flipped it. What IS stable across both "
+                   "regimes is GetSourceEndTime x media_fps, which was exact "
+                   "on 12 of 12 valid items (30.633 s x 24 = 735.19 -> 735; "
+                   "24.524 s x 29.97 = 734.98 -> 735) — seconds carry no "
+                   "frame-rate assumption, so the product is in source space "
+                   "by construction.",
+        "recommended": "Convert an audio item's source frames with the MEDIA's rate, "
+                       "never the timeline's: seconds = source_start / media_fps. "
+                       "READ media_fps from the media-pool item's 'FPS' clip property "
+                       "(or ffprobe) every time — do not infer it from the timeline, "
+                       "and do NOT hard-code 24 for a WAV: that number is whatever "
+                       "the project rate was when the clip was imported, so it is 24 "
+                       "only for a project that was at 24, and a WAV imported at "
+                       "29.97 has no mismatch at all. Feed the frames back to timeline "
+                       "create_variant_from_ranges in the same media-rate space you "
+                       "read them in; it converts on placement and reports the "
+                       "conversion in items[].duration_delta. The separate "
+                       "GetSourceStartFrame entry above (off-by-one vs "
+                       "GetLeftOffset) applies on top of this — the rate question "
+                       "is which unit the number is in, not whether it is exact. "
+                       "Mitigated in-process: _timeline_item_summary now emits "
+                       "source_fps and source_start_seconds/source_end_seconds "
+                       "beside the frames, so the number always arrives with its "
+                       "unit; on the GetLeftOffset fallback for an audio item it "
+                       "reports the rate as unknown rather than converting a "
+                       "timeline-frame value at the media rate. source_end is "
+                       "no longer source_start + TIMELINE duration: as of "
+                       "v2.93.0 it is round(GetSourceEndTime x media_fps), "
+                       "which is a SOURCE frame by construction and stays "
+                       "EXCLUSIVE as every caller already assumed. Measured "
+                       "live on 19.1.3.7 over 8 items in both regimes, it "
+                       "equals the endFrame actually sent every time, and it "
+                       "reproduces the old value exactly wherever the old value "
+                       "was already right — so matched-rate media does not "
+                       "move. The old arithmetic overshot by +24/+26/+108/+149 "
+                       "frames on the mismatched WAV, and timeline "
+                       "extract_source_frame_ranges built pull ranges out of "
+                       "it: widths of 543 and 749 for clips that consume 435 "
+                       "and 600 source frames. It falls back to the old sum "
+                       "only when GetSourceEndTime or the rate is unreadable.",
+        "tags": ["timeline", "audio", "wav", "frame-rate", "mixed-fps",
+                 "silent-failure", "readback"],
+        "submit": "bug",
+        "mitigation": ["_media_item_source_fps", "_source_frames_to_seconds",
+                       "_timeline_item_source_seconds",
+                       "_timeline_item_source_end_exclusive"],
+    },
+    {
         "symbol": "Razor / blade / split a timeline item",
         "object": "Timeline / TimelineItem",
         "reality": "There is no method to split/cut/blade a clip at a given frame. "
@@ -900,6 +1030,68 @@ API_TRUTH: List[Dict[str, Any]] = [
                        "per run is not achievable, a consistent template mix is.",
         "tags": ["missing-method", "audio", "fairlight", "ai", "auto-mix"],
         "submit": "missing",
+    },
+    {
+        "symbol": "Studio-gated calls on the free edition raise a modal that blocks LATER calls",
+        "object": "Resolve (all objects)",
+        "reality": "Calling a Studio-only function from the free edition returns "
+                   "False, which the reference documents. What it does NOT "
+                   "document: Resolve also raises a modal upsell dialog ('You "
+                   "have reached a limitation with DaVinci Resolve'), and while "
+                   "that dialog is up, UNRELATED subsequent API calls fail too. "
+                   "Confirmed live on free 21.0.3.7 over the in-app bridge "
+                   "(2026-08-06): Timeline.CreateSubtitlesFromAudio and "
+                   "MediaPoolItem.TranscribeAudio each returned False and raised "
+                   "the dialog; Project.SaveProject then returned False on every "
+                   "attempt until a human clicked 'Not Yet', after which it "
+                   "succeeded. Nothing in any return value, and no error, names "
+                   "the dialog — an automated caller sees only a cascade of "
+                   "unexplained False returns and will misattribute them to "
+                   "whatever it called next.",
+        "recommended": "Detect the edition BEFORE calling Studio-gated features "
+                       "rather than discovering the gate by tripping it: the "
+                       "product name is 'DaVinci Resolve' on free and 'DaVinci "
+                       "Resolve Studio' on Studio (resolve_control get_version "
+                       "reports it). If a Studio-only call has already returned "
+                       "False on a free build, treat every following failure as "
+                       "suspect: re-run a known-good read, and if that fails too, "
+                       "a modal is blocking and only a human can dismiss it — no "
+                       "API closes it. Known Studio-gated so far: subtitle "
+                       "generation from audio, and audio transcription.",
+        "tags": ["free-edition", "studio-only", "silent-failure", "modal", "ai",
+                 "subtitle", "transcription"],
+        "submit": "bug",
+    },
+    {
+        "symbol": "SetRenderSettings ExportSubtitle / SubtitleFormat had no observable effect",
+        "object": "Project (render settings)",
+        "reality": "Queuing a render with {'ExportSubtitle': True, "
+                   "'SubtitleFormat': 'BurnIn'} returned success from "
+                   "SetRenderSettings and rendered without error, but the output "
+                   "contained NO subtitles in any form: no burned-in pixels (every "
+                   "frame of the region carrying 7 subtitle items was fully black "
+                   "and byte-identical), no embedded subtitle stream (ffprobe saw "
+                   "only video/audio/data), and no sidecar file. Observed on "
+                   "Studio 19.1.3.7, 2026-08-06, on a timeline whose subtitle "
+                   "track held 7 generated caption items. "
+                   "NOT YET DISTINGUISHED: whether Resolve ignores these keys, or "
+                   "whether burn-in has an unmet precondition (a Deliver-page "
+                   "toggle, a subtitle track enabled for output, or a format that "
+                   "supports it). Both are consistent with what was seen, so this "
+                   "is recorded as an observation rather than asserted as a "
+                   "Resolve bug. Note the related confirmed trap: SetRenderSettings "
+                   "applies on top of whatever state the Deliver page holds "
+                   "(issue #123), so an inherited preset can override a key that "
+                   "was passed.",
+        "recommended": "Do not trust a render's subtitle settings from the "
+                       "settings_success boolean. VERIFY the artifact: ffprobe the "
+                       "output for a subtitle stream, check for a sidecar file, or "
+                       "sample frames for burned-in pixels. If subtitles must be "
+                       "burned in, confirm the result before delivering.",
+        "tags": ["render", "subtitle", "silent-failure", "unverified-cause",
+                 "deliver"],
+        "submit": "bug",
+        "issue": 123,
     },
     {
         "symbol": "Proxy / optimized-media generation",
