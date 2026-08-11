@@ -1539,6 +1539,15 @@ Key actions: `add_comp`, `get_comp_count`, `get_comp_names`, `export_comp(path, 
 `import_comp(path)`, `delete_comp(name)`, `load_comp(name)`, `rename_comp`,
 `get_cache_enabled`, `set_cache(value)` — value: `"Auto"`, `"On"`, `"Off"`
 
+`add_comp` verifies the mutation by the item's real comp count rather than by
+what `AddFusionComp` returns, because on a generator item Resolve returns None
+while still creating the comp (measured on Studio 20.2.1.6). It answers
+`{success, comp_count_before, comp_count_after, delta, native_returned_object,
+created_comp_name}`; `created_comp_name` is best-effort and may be null, since
+comp names are not unique. A non-success result is never retryable once the call
+has been made — read `get_comp_count` before deciding, because `AddFusionComp`
+always appends a NEW comp and a blind retry leaves the item with two.
+
 **`timeline_item_color`** — Color grading on timeline items. Requires Color page
 for most operations.
 
